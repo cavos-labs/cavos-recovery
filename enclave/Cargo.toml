@@ -1,0 +1,58 @@
+[package]
+name = "cavos-confidential-recovery"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+[dependencies]
+aes-gcm = "0.10"
+anyhow = "1"
+base64 = "0.22"
+ecdsa = "0.16"
+hkdf = "0.12"
+jsonwebtoken = { version = "9", default-features = false, features = ["use_pem"] }
+p256 = { version = "0.13", features = ["ecdh", "ecdsa", "pem", "pkcs8"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+subtle = "2"
+tokio = { version = "1", features = ["macros", "net", "rt-multi-thread", "time", "io-util", "sync"] }
+url = "2"
+uuid = { version = "1", features = ["serde", "v4"] }
+zeroize = { version = "1", features = ["derive"] }
+
+# --- Nitro Enclaves ---
+# The enclave talks to the outside world only over vsock, and proves what it is
+# with an attestation document from the Nitro Security Module.
+tokio-vsock = "0.7"
+aws-nitro-enclaves-nsm-api = "0.5"
+serde_bytes = "0.11"
+
+# KMS returns the unwrapped root key as a CMS enveloped structure encrypted to
+# an RSA key the enclave attests to. OpenSSL is used rather than the pure-Rust
+# `cms`/`rsa` crates because those are still pre-release, and this code path
+# guards every user's recovery key. `vendored` links it statically so the
+# distroless runtime image needs no shared library.
+openssl = { version = "0.10", features = ["vendored"] }
+hex = "0.4"
+libc = "0.2"
+
+# SigV4 is signed by hand rather than with `aws-sigv4`, which pulls in eight
+# crates of the Smithy runtime for the single KMS Decrypt call this workload
+# makes. Every dependency here is measured into PCR0 and has to be auditable,
+# so a well-specified ~80-line signer with published test vectors is the
+# cheaper trade. See `kms::sigv4`.
+hmac = "0.12"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "z"
+panic = "abort"
+strip = true

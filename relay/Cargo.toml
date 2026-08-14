@@ -1,0 +1,25 @@
+[package]
+name = "cavos-recovery-relay"
+version = "0.1.0"
+edition = "2021"
+license = "BUSL-1.1"
+publish = false
+
+# The relay is deliberately unremarkable. It is untrusted by design — it only
+# moves opaque frames between the control plane and the enclave — so dependency
+# weight here costs nothing in security, unlike inside the enclave where every
+# crate is measured into PCR0.
+[dependencies]
+anyhow = "1"
+axum = "0.8"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "net", "io-util", "time", "signal", "process"] }
+reqwest = { version = "0.12", default-features = false, features = ["json"] }
+tokio-vsock = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+[profile.release]
+opt-level = 2
+strip = true

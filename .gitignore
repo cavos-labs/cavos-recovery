@@ -1,0 +1,24 @@
+# Rust build output
+target/
+
+# The enclave image file: 50 MB, and rebuilt from source by
+# `enclave/scripts/build-enclave.sh`. Its measurement is what gets published,
+# not the artifact itself.
+enclave/build/
+
+# Terraform state tracks live infrastructure. It holds resource ids and the SSM
+# placeholder rather than secrets, but it is machine-local and must not be
+# committed. Move it to a versioned S3 backend before a second person applies.
+infra/.terraform/
+infra/*.tfstate
+infra/*.tfstate.*
+infra/tfplan
+
+# Release binaries, uploaded to S3 rather than committed.
+relay/relay-bin
+relay/cavos-recovery-relay-linux-arm64
+
+.DS_Store
+
+# Local tooling caches.
+.impeccable/

@@ -4,7 +4,7 @@ output "elastic_ip" {
     DNS is hosted. Caddy cannot obtain a certificate until that record resolves,
     so the relay stays unreachable over HTTPS until this step is done.
   EOT
-  value = aws_eip.instance.public_ip
+  value       = aws_eip.instance.public_ip
 }
 
 output "relay_url" {
@@ -27,7 +27,16 @@ output "enclave_pcr0" {
   value       = var.enclave_pcr0
 }
 
-output "instance_id" {
-  description = "Connect with: aws ssm start-session --target <this>"
-  value       = aws_instance.enclave_host.id
+output "autoscaling_group" {
+  description = <<-EOT
+    The host is a spot instance in this group, so its id changes whenever AWS
+    reclaims capacity. Find the current one with:
+
+      aws autoscaling describe-auto-scaling-groups \
+        --auto-scaling-group-names <this> \
+        --query 'AutoScalingGroups[0].Instances[0].InstanceId' --output text
+
+    then `aws ssm start-session --target <that>`.
+  EOT
+  value       = aws_autoscaling_group.enclave_host.name
 }

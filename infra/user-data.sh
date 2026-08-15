@@ -21,8 +21,31 @@ HOSTNAME="${hostname}"
 ARTIFACTS_BUCKET="${artifacts_bucket}"
 ENCLAVE_CPU_COUNT="${enclave_cpu_count}"
 ENCLAVE_MEMORY_MIB="${enclave_memory_mib}"
+EIP_ALLOCATION_ID="${eip_allocation_id}"
 
 dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel amazon-ssm-agent jq
+
+# ---------------------------------------------------------------------------
+# Claim the public address
+# ---------------------------------------------------------------------------
+# This host is one member of an autoscaling group of size one, bought on spot.
+# Nothing outside moves the address when a replacement launches, so it takes the
+# address itself. `--allow-reassociation` is the part that matters: the outgoing
+# instance may still hold it, and during a capacity rebalance it certainly does.
+#
+# This has to happen before Caddy starts. Let's Encrypt resolves the hostname
+# over the public internet, and until the A record points at this instance the
+# HTTP-01 challenge reaches whatever held the address last.
+IMDS_TOKEN="$(curl -sS -X PUT "http://169.254.169.254/latest/api/token" \
+  -H "X-aws-ec2-metadata-token-ttl-seconds: 300")"
+INSTANCE_ID="$(curl -sS -H "X-aws-ec2-metadata-token: $IMDS_TOKEN" \
+  http://169.254.169.254/latest/meta-data/instance-id)"
+
+aws ec2 associate-address \
+  --region "$REGION" \
+  --instance-id "$INSTANCE_ID" \
+  --allocation-id "$EIP_ALLOCATION_ID" \
+  --allow-reassociation
 
 # The allocator reserves CPUs and memory for enclaves at boot. It has to be
 # configured before the service starts, and a change needs a reboot.
@@ -171,12 +194,56 @@ dnf install -y caddy || {
     | tar -xz -C /usr/local/bin caddy
 }
 
+# The storage path is pinned rather than left to Caddy's XDG default, which
+# depends on the packaging's HOME for the caddy user. The sync below has to name
+# one directory and be right about it.
 cat >/etc/caddy/Caddyfile <<EOF
+{
+	storage file_system /var/lib/caddy/storage
+}
+
 $HOSTNAME {
 	reverse_proxy 127.0.0.1:8080
 }
 EOF
+
+# Restore the certificate before Caddy starts, so a replaced host reuses the
+# existing one instead of asking Let's Encrypt for another. LE issues at most
+# five duplicate certificates per hostname per week; on spot, where hosts are
+# replaced on AWS's schedule rather than ours, that quota is reachable in an
+# afternoon and the relay would sit without TLS until the window rolled off.
+mkdir -p /var/lib/caddy/storage
+aws s3 sync "s3://$ARTIFACTS_BUCKET/caddy/" /var/lib/caddy/storage/ --region "$REGION" || true
+chown -R caddy:caddy /var/lib/caddy
+
 systemctl enable --now caddy
 
+# Push it back as it changes. A timer rather than a hook because Caddy has no
+# post-renewal exec, and because the failure mode of syncing too often is a few
+# cents of PUT requests, while the failure mode of missing a renewal is the
+# outage described above. Renewals happen roughly every sixty days.
+cat >/etc/systemd/system/cavos-caddy-backup.service <<EOF
+[Unit]
+Description=Back up Caddy's certificate store to S3
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/aws s3 sync /var/lib/caddy/storage/ s3://$ARTIFACTS_BUCKET/caddy/ --region $REGION --delete
+EOF
+
+cat >/etc/systemd/system/cavos-caddy-backup.timer <<EOF
+[Unit]
+Description=Periodic backup of Caddy's certificate store
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=1h
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+EOF
+
 systemctl daemon-reload
+systemctl enable --now cavos-caddy-backup.timer
 systemctl enable --now cavos-vsock-kms cavos-vsock-oidc cavos-relay cavos-enclave

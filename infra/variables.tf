@@ -4,19 +4,44 @@ variable "region" {
   default     = "us-east-1"
 }
 
-variable "instance_type" {
+variable "instance_types" {
   description = <<-EOT
-    Graviton instance hosting the enclave. Graviton is used because its enclave
-    minimum is 2 vCPUs where Intel/AMD need 4, which halves the bill.
+    Graviton instances the spot fleet may draw from, in order of preference.
+    Graviton is used because its enclave minimum is 2 vCPUs where Intel/AMD need
+    4, which halves the bill.
 
-    c6g.large (2 vCPU / 4 GB, ~$50/mo) gives the enclave 1 vCPU and the parent
-    1. Graviton has no SMT so that split is real, not shared. It is enough for
-    this workload — roughly two seconds of P-256 and AES per request — but it
-    has no headroom. If bring-up shows contention, c6g.xlarge is a one-line
-    change and a re-apply.
+    c6g.large (2 vCPU / 4 GB) gives the enclave 1 vCPU and the parent 1.
+    Graviton has no SMT so that split is real, not shared. It is enough for this
+    workload — roughly two seconds of P-256 and AES per request — but it has no
+    headroom. The m-family entries are the same 2 vCPUs with more memory, which
+    the allocator ignores; they are here for capacity breadth, not performance.
+
+    The list is what makes running 100% spot reasonable. One instance type in
+    one subnet is a single capacity pool and a single point of reclamation; five
+    types across the default subnets is roughly twenty-five, and the allocation
+    strategy picks the deepest. Every entry must support Nitro Enclaves — check
+    with `aws ec2 describe-instance-types --filters
+    Name=nitro-enclaves-support,Values=supported` before adding one. No
+    burstable (t3/t4g) instance qualifies.
   EOT
-  type        = string
-  default     = "c6g.large"
+  type        = list(string)
+  default     = ["c6g.large", "c7g.large", "m6g.large", "m7g.large", "c8g.large"]
+
+  validation {
+    condition     = length(var.instance_types) > 0
+    error_message = "At least one instance type is required."
+  }
+}
+
+variable "root_volume_size" {
+  description = <<-EOT
+    Root volume in GiB. The host stores the AL2023 base, a handful of packages,
+    the enclave image and the relay binary; 10 GiB leaves room without paying
+    for empty gp3. Caddy's certificate store is the one thing that must outlive
+    the volume, and it lives in S3 for that reason.
+  EOT
+  type        = number
+  default     = 10
 }
 
 variable "enclave_cpu_count" {

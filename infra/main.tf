@@ -8,10 +8,40 @@ data "aws_vpc" "default" {
   default = true
 }
 
+# Not every availability zone offers every instance type. us-east-1e is the
+# live example: it is in the default VPC and offers no Graviton at all, so an
+# autoscaling group handed the full subnet list will eventually try to place
+# there and fail the whole scaling activity with InvalidFleetConfiguration.
+#
+# Rather than hard-coding the exclusion, ask EC2 which zones offer each type in
+# the fleet and keep only the zones that offer all of them. Adding an instance
+# type to var.instance_types then narrows the zone list on its own.
+data "aws_ec2_instance_type_offerings" "by_az" {
+  for_each = toset(var.instance_types)
+
+  location_type = "availability-zone"
+
+  filter {
+    name   = "instance-type"
+    values = [each.value]
+  }
+}
+
+locals {
+  supported_azs = setintersection([
+    for offering in data.aws_ec2_instance_type_offerings.by_az : toset(offering.locations)
+  ]...)
+}
+
 data "aws_subnets" "default" {
   filter {
     name   = "vpc-id"
     values = [data.aws_vpc.default.id]
+  }
+
+  filter {
+    name   = "availability-zone"
+    values = tolist(local.supported_azs)
   }
 }
 
@@ -194,9 +224,49 @@ resource "aws_iam_role_policy" "instance" {
         Resource = "${aws_s3_bucket.artifacts.arn}/*"
       },
       {
-        Sid      = "ReadItsOwnConfiguration"
+        # Caddy's certificate store, kept in S3 rather than on the root volume.
+        #
+        # On spot the host is cattle: an interruption replaces it, and a fresh
+        # /var/lib/caddy means Caddy asks Let's Encrypt for a new certificate.
+        # LE allows five duplicate certificates per hostname per week, so a bad
+        # afternoon would exhaust the quota and leave the relay without TLS for
+        # days — an outage caused by the cost optimisation itself.
+        #
+        # The certificate's private key therefore lives in this bucket. That is
+        # a real widening and worth stating plainly: anyone who can read the
+        # bucket can impersonate `enclave.cavos.xyz` to the control plane. It
+        # does not reach the enclave's secrets — the browser encrypts to an
+        # attested key and KMS checks PCR0, neither of which TLS is load-bearing
+        # for — but it is not nothing. The bucket blocks public access, is
+        # versioned, and is encrypted at rest.
+        Sid      = "PersistTheCertificateStore"
         Effect   = "Allow"
-        Action   = ["ssm:GetParameter", "ssm:GetParameters"]
+        Action   = ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"]
+        Resource = "${aws_s3_bucket.artifacts.arn}/caddy/*"
+      },
+      {
+        Sid      = "ListForCaddySync"
+        Effect   = "Allow"
+        Action   = ["s3:ListBucket"]
+        Resource = aws_s3_bucket.artifacts.arn
+        Condition = {
+          StringLike = { "s3:prefix" = ["caddy/*", "caddy"] }
+        }
+      },
+      {
+        # Under an autoscaling group the instance is replaced without terraform
+        # in the loop, so nothing outside can move the address for it. It claims
+        # the address itself at boot; `--allow-reassociation` is what lets it
+        # take over from the instance it is replacing.
+        Sid      = "ClaimTheElasticIp"
+        Effect   = "Allow"
+        Action   = ["ec2:AssociateAddress", "ec2:DescribeAddresses"]
+        Resource = "*"
+      },
+      {
+        Sid    = "ReadItsOwnConfiguration"
+        Effect = "Allow"
+        Action = ["ssm:GetParameter", "ssm:GetParameters"]
         Resource = [
           aws_ssm_parameter.wrapped_root_key.arn,
           aws_ssm_parameter.relay_secret.arn,
@@ -277,14 +347,30 @@ resource "aws_security_group" "instance" {
 }
 
 # ---------------------------------------------------------------------------
-# The instance
+# The address
 # ---------------------------------------------------------------------------
-resource "aws_instance" "enclave_host" {
-  ami                    = data.aws_ami.al2023_arm64.id
-  instance_type          = var.instance_type
-  subnet_id              = data.aws_subnets.default.ids[0]
+# Declared before the host, and no longer attached to it. Under an autoscaling
+# group there is no long-lived instance to bind to, so the address stands alone
+# and each instance claims it at boot (see `ClaimTheElasticIp` above). The DNS
+# record for var.hostname keeps pointing here across every replacement.
+resource "aws_eip" "instance" {
+  domain = "vpc"
+  tags   = { Name = "${local.name}-eip" }
+}
+
+# ---------------------------------------------------------------------------
+# The host
+# ---------------------------------------------------------------------------
+resource "aws_launch_template" "enclave_host" {
+  name_prefix   = "${local.name}-"
+  image_id      = data.aws_ami.al2023_arm64.id
+  instance_type = var.instance_types[0]
+
+  iam_instance_profile {
+    name = aws_iam_instance_profile.instance.name
+  }
+
   vpc_security_group_ids = [aws_security_group.instance.id]
-  iam_instance_profile   = aws_iam_instance_profile.instance.name
 
   enclave_options {
     enabled = true
@@ -295,13 +381,16 @@ resource "aws_instance" "enclave_host" {
     http_endpoint = "enabled"
   }
 
-  root_block_device {
-    volume_size = 30
-    volume_type = "gp3"
-    encrypted   = true
+  block_device_mappings {
+    device_name = "/dev/xvda"
+    ebs {
+      volume_size = var.root_volume_size
+      volume_type = "gp3"
+      encrypted   = true
+    }
   }
 
-  user_data = templatefile("${path.module}/user-data.sh", {
+  user_data = base64encode(templatefile("${path.module}/user-data.sh", {
     region             = var.region
     hostname           = var.hostname
     artifacts_bucket   = aws_s3_bucket.artifacts.bucket
@@ -309,18 +398,99 @@ resource "aws_instance" "enclave_host" {
     enclave_memory_mib = var.enclave_memory_mib
     root_key_param     = aws_ssm_parameter.wrapped_root_key.name
     relay_secret_param = aws_ssm_parameter.relay_secret.name
-  })
+    eip_allocation_id  = aws_eip.instance.id
+  }))
 
-  # Changing user_data should rebuild the host; it is the whole bootstrap.
-  user_data_replace_on_change = true
+  tag_specifications {
+    resource_type = "instance"
+    tags          = { Name = "${local.name}-host" }
+  }
 
-  tags = { Name = "${local.name}-host" }
+  lifecycle {
+    create_before_destroy = true
+  }
 }
 
-# A stable address, so the DNS record does not have to change when the instance
-# is replaced. Free while it stays associated.
-resource "aws_eip" "instance" {
-  instance = aws_instance.enclave_host.id
-  domain   = "vpc"
-  tags     = { Name = "${local.name}-eip" }
+# One instance, bought on the spot market.
+#
+# The workload is a good fit for spot in a way that is worth being explicit
+# about: the enclave holds no durable state. It re-fetches the wrapped root key
+# from Parameter Store and unwraps it against KMS on every boot, so a replaced
+# host rebuilds itself from scratch with no data to restore. An interruption is
+# an outage, not a loss.
+#
+# What it costs is availability. There are no retries in `@cavos/kit`'s recovery
+# client — every failure path throws — so a user who calls enrol or recover
+# during a replacement sees a hard error rather than a pause. Baking a golden
+# AMI (boot is currently 3-6 minutes of `dnf install`) and adding client-side
+# backoff would both shrink that window substantially; neither is done yet.
+resource "aws_autoscaling_group" "enclave_host" {
+  name                = "${local.name}-host"
+  vpc_zone_identifier = data.aws_subnets.default.ids
+
+  min_size         = 1
+  max_size         = 2 # Headroom for capacity rebalancing to start the replacement first.
+  desired_capacity = 1
+
+  # Replace the host when AWS signals it is at elevated risk of interruption,
+  # rather than waiting for the two-minute termination notice. The replacement
+  # claims the Elastic IP with `--allow-reassociation`, so the handover needs no
+  # coordination. Sessions are the one casualty: they live in enclave memory, so
+  # a session opened against the outgoing host cannot complete against the new
+  # one. They are single-use and short-lived, and the client starts a fresh one.
+  capacity_rebalance = true
+
+  health_check_type         = "EC2"
+  health_check_grace_period = 600 # Cold boot installs packages; see the golden-AMI note.
+
+  mixed_instances_policy {
+    instances_distribution {
+      # 100% spot. At capacity 1 any on-demand base would mean paying the
+      # on-demand price for the only instance, which is the whole point of this
+      # change. Durability comes from breadth instead: five instance types
+      # across every default subnet is roughly twenty-five capacity pools, and
+      # `price-capacity-optimized` picks the one least likely to be reclaimed.
+      on_demand_base_capacity                  = 0
+      on_demand_percentage_above_base_capacity = 0
+      spot_allocation_strategy                 = "price-capacity-optimized"
+    }
+
+    launch_template {
+      launch_template_specification {
+        launch_template_id = aws_launch_template.enclave_host.id
+        version            = aws_launch_template.enclave_host.latest_version
+      }
+
+      # Every type here is arm64, has at least 2 vCPUs, and supports Nitro
+      # Enclaves — verified with `describe-instance-types`. The allocator asks
+      # for 1 vCPU and 1 GiB regardless, so the larger m-family members simply
+      # leave more for the parent. Burstable types are absent because no t3 or
+      # t4g instance supports enclaves at all.
+      dynamic "override" {
+        for_each = var.instance_types
+        content {
+          instance_type = override.value
+        }
+      }
+    }
+  }
+
+  # Roll the fleet when the launch template changes; user_data is the whole
+  # bootstrap, so a change to it has to reach the running host.
+  instance_refresh {
+    strategy = "Rolling"
+    preferences {
+      min_healthy_percentage = 0 # Capacity 1: the old host must go before the new one arrives.
+    }
+  }
+
+  tag {
+    key                 = "Name"
+    value               = "${local.name}-host"
+    propagate_at_launch = true
+  }
+
+  timeouts {
+    delete = "15m"
+  }
 }

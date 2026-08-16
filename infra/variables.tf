@@ -65,12 +65,18 @@ variable "enclave_pcr0" {
     The measurement of the enclave image, from `scripts/build-enclave.sh`.
 
     This is the security-critical value: the KMS key policy will not release the
-    root sealing key to anything that does not measure to it. It must match the
+    root sealing key to anything that does not measure to it. It must match a
     value pinned in `@cavos/kit`, or browsers and KMS will disagree about which
     enclave is legitimate.
+
+    Changing it is half of a deploy: KMS will then release the root key only to
+    the new image, so the new EIF has to be uploaded in the same step or the
+    running enclave dies at boot unable to unwrap it. And the SDK has to accept
+    the new measurement *before* either — it is checked in the browser, ahead of
+    KMS, so an enclave nobody accepts is one nobody can reach.
   EOT
   type        = string
-  default     = "f2f81237afb5ecd3287e622c711bef8e5fe382f13c549794e478be3f54877d0c0c80a7bc9f97150fc28150130f373f87"
+  default     = "3a97720a6e8a7a0ce034703be64d12e6ceadabdedf807656df6516770848da70f9f3a69ba355ccd4d1b1fc7ac3116aa4"
 
   validation {
     condition     = can(regex("^[0-9a-f]{96}$", var.enclave_pcr0))

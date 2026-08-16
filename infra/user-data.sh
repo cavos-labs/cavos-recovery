@@ -5,9 +5,11 @@
 # Three processes cooperate, and only one of them is trusted:
 #
 #   enclave      the measured workload; holds every secret
-#   vsock-proxy  gives the enclave outbound TLS to KMS and provider JWKS,
-#                relaying ciphertext it cannot read
-#   relay        accepts HTTPS from the control plane and forwards frames
+#   vsock-proxy  gives the enclave outbound TLS to KMS, one fixed host
+#   relay        accepts HTTPS from the control plane, forwards frames to the
+#                enclave, and carries its outbound TLS to the identity providers
+#                — ciphertext it cannot read, to whichever host each ClientHello
+#                names
 #
 # Everything here runs on the untrusted parent. A compromise of this script can
 # deny service; it cannot read a user's credential or impersonate the enclave,
@@ -65,17 +67,14 @@ chmod +x /opt/cavos/relay
 # ---------------------------------------------------------------------------
 # Outbound for the enclave
 # ---------------------------------------------------------------------------
-# The enclave has no network device. vsock-proxy opens a TCP connection to a
-# fixed allow-listed host on its behalf. TLS is negotiated *inside* the enclave,
-# so this process moves ciphertext: it cannot read the KMS traffic and cannot
-# impersonate accounts.google.com, because it has no certificate for it.
+# The enclave has no network device, so something on this side opens its TCP
+# connections. TLS is negotiated *inside* the enclave either way, so both paths
+# below move ciphertext they cannot read.
+#
+# KMS is one host, so a fixed-destination vsock-proxy is exactly right.
 cat >/etc/nitro_enclaves/vsock-proxy.yaml <<EOF
 allowlist:
 - {address: kms.$REGION.amazonaws.com, port: 443}
-- {address: accounts.google.com, port: 443}
-- {address: www.googleapis.com, port: 443}
-- {address: appleid.apple.com, port: 443}
-- {address: securetoken.google.com, port: 443}
 EOF
 
 cat >/etc/systemd/system/cavos-vsock-kms.service <<EOF
@@ -91,21 +90,19 @@ Restart=always
 WantedBy=multi-user.target
 EOF
 
-# One proxy per port, and the enclave maps every provider host to this one. The
-# hostname below is only the default target; the enclave preserves SNI and the
-# Host header, so the connection is validated against the real name inside.
-cat >/etc/systemd/system/cavos-vsock-oidc.service <<EOF
-[Unit]
-Description=vsock proxy: enclave -> identity provider JWKS
-After=nitro-enclaves-allocator.service
-
-[Service]
-ExecStart=/usr/bin/vsock-proxy 8001 www.googleapis.com 443 --config /etc/nitro_enclaves/vsock-proxy.yaml
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-EOF
+# The identity providers are not, and that is why this used to be broken.
+# vsock-proxy takes its destination on the command line, so one instance serves
+# one host — but the enclave resolves all four provider hosts to a single port.
+# The instance here was started with www.googleapis.com, where Google's and
+# Firebase's JWKS both live, so those two worked. Apple's keys are at
+# appleid.apple.com, so every Apple verification opened TLS to Google's servers,
+# failed the certificate check inside the enclave, and surfaced as an opaque
+# `request_failed`.
+#
+# The relay serves that port instead, reading the name out of each ClientHello
+# and dialing it. See relay/src/sni.rs for why routing on an untrusted parent is
+# safe: the enclave validates the certificate itself, so a wrong destination is
+# a failed handshake, never a redirected session.
 
 # ---------------------------------------------------------------------------
 # The enclave
@@ -142,8 +139,8 @@ Description=Cavos confidential recovery enclave
 # listening first. That inverts the obvious dependency: the relay does not need
 # the enclave to bind its own ports, but the enclave cannot start without the
 # relay's configuration service.
-After=cavos-vsock-kms.service cavos-vsock-oidc.service cavos-relay.service
-Requires=cavos-vsock-kms.service cavos-vsock-oidc.service cavos-relay.service
+After=cavos-vsock-kms.service cavos-relay.service
+Requires=cavos-vsock-kms.service cavos-relay.service
 
 [Service]
 Type=oneshot
@@ -246,4 +243,4 @@ EOF
 
 systemctl daemon-reload
 systemctl enable --now cavos-caddy-backup.timer
-systemctl enable --now cavos-vsock-kms cavos-vsock-oidc cavos-relay cavos-enclave
+systemctl enable --now cavos-vsock-kms cavos-relay cavos-enclave

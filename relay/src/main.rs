@@ -40,6 +40,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 
+mod sni;
+
 /// vsock port the enclave listens on. Must match the enclave's `SERVICE_PORT`.
 const ENCLAVE_PORT: u32 = 5005;
 
@@ -57,6 +59,14 @@ const CONFIG_PORT: u32 = 5006;
 /// in exactly the configuration where the enclave could explain itself. Without
 /// this channel a production enclave that will not start is undiagnosable.
 const LOG_PORT: u32 = 5007;
+
+/// vsock port the enclave opens outbound TLS on.
+///
+/// The enclave resolves every provider host to one local port, so what listens
+/// here has to pick the destination per connection. `vsock-proxy` cannot: its
+/// destination is a command-line argument, which is why Apple's JWKS was being
+/// dialed at `www.googleapis.com`. See `sni`.
+const OUTBOUND_PORT: u32 = 8001;
 
 /// Ceiling on a response frame from the enclave. Matches the enclave's own
 /// inbound limit, so neither side can be made to allocate without bound.
@@ -114,6 +124,13 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(error) = serve_enclave_log().await {
             tracing::error!(%error, "enclave log service stopped");
+        }
+    });
+
+    // Outbound TLS for the enclave, routed by the name in each ClientHello.
+    tokio::spawn(async move {
+        if let Err(error) = sni::serve(OUTBOUND_PORT).await {
+            tracing::error!(%error, "outbound TLS forwarder stopped");
         }
     });
 

@@ -98,3 +98,25 @@ variable "ssh_ingress_cidrs" {
   type        = list(string)
   default     = []
 }
+
+variable "host_count" {
+  description = <<-EOT
+    How many enclave hosts to run. One, or zero to turn the service off.
+
+    Zero is a real operating state, not a broken one: the enclave holds no
+    durable state. The wrapped root key lives in Parameter Store, the image and
+    the relay binary in S3, and the KMS key policy is untouched — so coming back
+    is this variable and an apply, with nothing to restore.
+
+    While it is zero, social recovery does not work: no enrolment, no recovery.
+    Wallets keep signing, because that is the device signer against the contract
+    on-chain and has never involved this host. No funds are at risk either way.
+  EOT
+  type        = number
+  default     = 0
+
+  validation {
+    condition     = var.host_count >= 0 && var.host_count <= 1
+    error_message = "The enclave host is a singleton: 0 or 1."
+  }
+}

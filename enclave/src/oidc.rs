@@ -1,4 +1,6 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+
+use crate::failure::Failure;
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
     decode, decode_header,
@@ -65,26 +67,36 @@ pub async fn verify_id_token(
     policy: &RecoveryPolicy,
     expected_auth_challenge_hash: &str,
 ) -> Result<IdentityClaims> {
-    validate_provider_policy(policy)?;
-    verify_credential_binding(credential, expected_auth_challenge_hash)?;
+    validate_provider_policy(policy).context(Failure::PolicyRejected)?;
+    verify_credential_binding(credential, expected_auth_challenge_hash)
+        .context(Failure::CredentialBinding)?;
     let token = &credential.id_token;
-    let header = decode_header(token).context("invalid OIDC token header")?;
-    let kid = header.kid.context("OIDC token omitted kid")?;
+    let header = decode_header(token)
+        .context("invalid OIDC token header")
+        .context(Failure::SignatureRejected)?;
+    let kid = header
+        .kid
+        .context("OIDC token omitted kid")
+        .context(Failure::SignatureRejected)?;
     let jwks: JwkSet = http
         .get(&policy.jwks_uri)
         .send()
         .await
-        .context("JWKS request failed")?
+        .context("JWKS request failed")
+        .context(Failure::JwksUnreachable)?
         .error_for_status()
-        .context("JWKS endpoint rejected request")?
+        .context("JWKS endpoint rejected request")
+        .context(Failure::JwksUnreachable)?
         .json()
         .await
-        .context("invalid JWKS")?;
+        .context("invalid JWKS")
+        .context(Failure::JwksUnreachable)?;
     let jwk = jwks
         .keys
         .iter()
         .find(|key| key.common.key_id.as_deref() == Some(kid.as_str()))
-        .context("OIDC signing key not found")?;
+        .context("OIDC signing key not found")
+        .context(Failure::SignatureRejected)?;
 
     let (algorithm, decoding_key) = match &jwk.algorithm {
         AlgorithmParameters::RSA(rsa) => (
@@ -104,7 +116,7 @@ pub async fn verify_id_token(
         _ => bail!("unsupported OIDC signing key type"),
     };
     if header.alg != algorithm {
-        bail!("OIDC alg/key mismatch");
+        return Err(anyhow!("OIDC alg/key mismatch").context(Failure::SignatureRejected));
     }
 
     let mut validation = Validation::new(algorithm);
@@ -113,10 +125,11 @@ pub async fn verify_id_token(
     validation.validate_exp = true;
     validation.leeway = 30;
     let claims = decode::<IdentityClaims>(token, &decoding_key, &validation)
-        .context("OIDC signature/claims verification failed")?
+        .context("OIDC signature/claims verification failed")
+        .context(Failure::ClaimsRejected)?
         .claims;
     if claims.iss != policy.issuer || !claims.aud.contains(&policy.audience) {
-        bail!("OIDC issuer or audience mismatch");
+        return Err(anyhow!("OIDC issuer or audience mismatch").context(Failure::ClaimsRejected));
     }
     let email_verified = match claims.email_verified.as_ref() {
         Some(serde_json::Value::Bool(true)) => true,
@@ -124,9 +137,9 @@ pub async fn verify_id_token(
         _ => false,
     };
     if matches!(policy.provider, SocialProvider::Email) && !email_verified {
-        bail!("email identity is not verified");
+        return Err(anyhow!("email identity is not verified").context(Failure::ClaimsRejected));
     }
-    enforce_recent_auth(&claims, &policy.provider, unix_time()?)?;
+    enforce_recent_auth(&claims, &policy.provider, unix_time()?).context(Failure::AuthStale)?;
     Ok(claims)
 }
 

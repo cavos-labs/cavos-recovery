@@ -25,6 +25,7 @@
 //! finds nothing.
 
 mod crypto;
+mod failure;
 mod kms;
 mod nsm;
 mod oidc;
@@ -224,7 +225,10 @@ where
             // Log the detail inside the enclave; return only a coarse code, so
             // the untrusted relay learns nothing about why a credential failed.
             eprintln!("[enclave] request failed: {error:#}");
-            EnclaveResponse::Error { code: "request_failed".into() }
+            // The detail stays inside; the class goes out. It names which check
+            // refused the request, never the value that failed it. See
+            // `failure` for why that distinction is the whole design.
+            EnclaveResponse::Error { code: failure::classify(&error).into() }
         }
     };
 
@@ -260,7 +264,8 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
                 let mut sessions = enclave.sessions.lock().await;
                 sessions
                     .claim(&session_id, Instant::now())
-                    .map_err(|_| anyhow!("unknown, expired, or already-used session"))?
+                    .map_err(|_| anyhow!("unknown, expired, or already-used session"))
+                    .context(failure::Failure::SessionUnknown)?
             };
             let plaintext = decrypt_job(&channel, &session_id, job)?;
             let job: WorkloadJob =
@@ -307,7 +312,8 @@ async fn process_job(
     match job {
         WorkloadJob::Enroll { credential, policy, stellar_dek_b64 } => {
             if credential.provider != policy.provider {
-                bail!("credential provider does not match policy");
+                return Err(anyhow!("credential provider does not match policy")
+                    .context(failure::Failure::ProviderMismatch));
             }
             let claims =
                 oidc::verify_id_token(&enclave.http, &credential, &policy, auth_challenge_hash)
@@ -352,7 +358,8 @@ async fn process_job(
             let record: SealedRecoveryRecord =
                 serde_json::from_slice(&record_bytes).context("invalid sealed recovery record")?;
             if record.version != 1 || credential.provider != record.policy.provider {
-                bail!("sealed recovery policy mismatch");
+                return Err(anyhow!("sealed recovery policy mismatch")
+                    .context(failure::Failure::ProviderMismatch));
             }
 
             let claims = oidc::verify_id_token(

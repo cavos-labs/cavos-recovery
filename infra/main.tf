@@ -428,9 +428,11 @@ resource "aws_autoscaling_group" "enclave_host" {
   name                = "${local.name}-host"
   vpc_zone_identifier = data.aws_subnets.default.ids
 
-  min_size         = 1
-  max_size         = 2 # Headroom for capacity rebalancing to start the replacement first.
-  desired_capacity = 1
+  min_size = var.host_count
+  # One more than the fleet, so capacity rebalancing can start a replacement
+  # before retiring the instance it replaces. Zero when the service is off.
+  max_size         = var.host_count == 0 ? 0 : var.host_count + 1
+  desired_capacity = var.host_count
 
   # Replace the host when AWS signals it is at elevated risk of interruption,
   # rather than waiting for the two-minute termination notice. The replacement

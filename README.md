@@ -52,11 +52,30 @@ rebuild and check.
 cd enclave && ./scripts/build-enclave.sh --expect <pcr0>
 ```
 
-## Deploying
+## Running it
 
-See `infra/README.md`. In short: `terraform apply`, run `bootstrap-secrets.sh`,
-build and upload the enclave image, point DNS at the Elastic IP.
+The host is **off**. It is meant to be: the service costs about $27/month to
+leave running and about $6.60/month idle, and until an app depends on recovery
+there is nothing for it to serve.
 
+```bash
+cd infra
+eval "$(aws configure export-credentials --format env)"
+terraform apply -var host_count=1
+```
+
+Roughly five minutes to a cold boot, then `curl https://enclave.cavos.xyz/health`
+answers `ok`. Turning it off again is `terraform apply` with no flag.
+
+Nothing is lost in between. The enclave keeps no durable state — the wrapped
+root key is in Parameter Store, the image and the relay binary in S3 — so a boot
+rebuilds the host from scratch, which is the same property that made buying it
+on spot reasonable.
+
+`infra/README.md` has the full runbook: how to verify the measurement after
+starting, how to turn on the relay's diagnostics, what the bill is made of, and
+the mistakes that have already cost us an afternoon. Read it before a first
+deploy, which is a different and longer procedure.
 ## History
 
 This service ran on Google Confidential Space until August 2026. That design

@@ -69,14 +69,22 @@ echo "==> Building the enclave image file"
 # `-devel` is required, not optional: it ships the kernel and init blobs under
 # /usr/share/nitro_enclaves/blobs that the EIF is assembled from. Without it the
 # build fails with a bare file-not-found on `cmdline`.
-docker build -q --platform "$PLATFORM" -t cavos-nitro-cli - <<'EOF' >/dev/null
+# The version is pinned in the install, not just asserted afterwards. Amazon
+# Linux moves this package — it shipped 1.4.5 while this recipe pinned 1.4.4 —
+# and an unpinned `dnf install` silently measures the same source differently
+# the day the repo rolls forward.
+docker build -q --platform "$PLATFORM" -t "cavos-nitro-cli:$NITRO_CLI_VERSION" \
+  --build-arg NITRO_CLI_VERSION="$NITRO_CLI_VERSION" - <<'EOF' >/dev/null
 FROM amazonlinux:2023
-RUN dnf install -y aws-nitro-enclaves-cli aws-nitro-enclaves-cli-devel
+ARG NITRO_CLI_VERSION
+RUN dnf install -y \
+      "aws-nitro-enclaves-cli-${NITRO_CLI_VERSION}" \
+      "aws-nitro-enclaves-cli-devel-${NITRO_CLI_VERSION}"
 EOF
 
 # The tool is an input to the measurement, so a version drift must fail loudly
 # rather than silently produce a PCR0 nobody else can reproduce.
-actual_cli=$(docker run --rm --platform "$PLATFORM" cavos-nitro-cli \
+actual_cli=$(docker run --rm --platform "$PLATFORM" "cavos-nitro-cli:$NITRO_CLI_VERSION" \
   nitro-cli --version | grep -oE '[0-9]+\.[0-9]+\.[0-9]+')
 if [[ $actual_cli != "$NITRO_CLI_VERSION" ]]; then
   echo "nitro-cli is $actual_cli but this recipe pins $NITRO_CLI_VERSION." >&2
@@ -87,7 +95,7 @@ fi
 measurements=$(docker run --rm --platform "$PLATFORM" \
   -v /var/run/docker.sock:/var/run/docker.sock \
   -v "$(cd "$OUTPUT_DIR" && pwd)":/out \
-  cavos-nitro-cli \
+  "cavos-nitro-cli:$NITRO_CLI_VERSION" \
   nitro-cli build-enclave --docker-uri "$IMAGE" --output-file /out/enclave.eif)
 
 pcr0=$(printf '%s' "$measurements" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR0"])')

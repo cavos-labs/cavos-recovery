@@ -140,7 +140,59 @@ pub async fn verify_id_token(
         return Err(anyhow!("email identity is not verified").context(Failure::ClaimsRejected));
     }
     enforce_recent_auth(&claims, &policy.provider, unix_time()?).context(Failure::AuthStale)?;
+    verify_login_binding(&claims, credential, policy).context(Failure::CredentialBinding)?;
     Ok(claims)
+}
+
+/// Length of a base64url-encoded SHA-256, and the least a login secret may be.
+const HASH_B64_LEN: usize = 43;
+
+/// Check that this token was minted for this app, at the request of whoever
+/// holds the login secret.
+///
+/// The provider signs one value the client chooses: the `nonce`. The login
+/// sends `<app_id>.<base64url(SHA-256(secret))>`, where the control plane
+/// supplies the app after validating it and the client supplies the hash
+/// (OpenID Connect Core §15.5.2; the hash is PKCE's S256, RFC 7636 §4.2).
+///
+/// Both halves matter. Without the app, a token one app obtains for a user is
+/// good against that user's wallet in every other app, since they share an
+/// audience. Without the secret, anyone who sees the token in transit can
+/// spend it.
+///
+/// Apple is also accepted with the nonce hashed once more, hex-encoded, which
+/// is the second form the control plane's callback already tolerates. Either
+/// form is a function of the same two inputs, so accepting both weakens
+/// nothing.
+fn verify_login_binding(
+    claims: &IdentityClaims,
+    credential: &ProviderCredential,
+    policy: &RecoveryPolicy,
+) -> Result<()> {
+    if matches!(policy.provider, SocialProvider::Email) {
+        // A Firebase email token has no nonce the login could have set.
+        return Ok(());
+    }
+    let secret = credential
+        .nonce_preimage
+        .as_deref()
+        .filter(|secret| secret.len() >= HASH_B64_LEN)
+        .context("credential carries no login secret")?;
+    let nonce = claims.nonce.as_deref().context("OIDC token carries no nonce")?;
+    let expected = format!(
+        "{}.{}",
+        policy.app_id,
+        URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()))
+    );
+
+    let matches = |candidate: &str| bool::from(nonce.as_bytes().ct_eq(candidate.as_bytes()));
+    if matches(&expected)
+        || (matches!(policy.provider, SocialProvider::Apple)
+            && matches(&hex_sha256(expected.as_bytes())))
+    {
+        return Ok(());
+    }
+    bail!("OIDC token is not bound to this app and login")
 }
 
 fn verify_credential_binding(
@@ -184,20 +236,13 @@ fn enforce_recent_auth(
         bail!("social authentication is too old; sign in again");
     }
 
-    match provider {
-        SocialProvider::Google | SocialProvider::Apple => {
-            if claims.nonce.as_deref().is_none_or(|nonce| nonce.len() < 16) {
-                bail!("OIDC token is not bound to a login nonce");
-            }
-        }
-        SocialProvider::Email => {
-            let sign_in_provider = claims
-                .firebase
-                .as_ref()
-                .and_then(|firebase| firebase.sign_in_provider.as_deref());
-            if !matches!(sign_in_provider, Some("password") | Some("emailLink")) {
-                bail!("Firebase token was not issued by the email provider");
-            }
+    if matches!(provider, SocialProvider::Email) {
+        let sign_in_provider = claims
+            .firebase
+            .as_ref()
+            .and_then(|firebase| firebase.sign_in_provider.as_deref());
+        if !matches!(sign_in_provider, Some("password") | Some("emailLink")) {
+            bail!("Firebase token was not issued by the email provider");
         }
     }
     Ok(())
@@ -278,6 +323,7 @@ mod tests {
             provider: SocialProvider::Google,
             id_token: token.into(),
             token_fingerprint: fingerprint.clone(),
+            nonce_preimage: None,
         };
         let expected = hex_sha256(fingerprint.as_bytes());
         assert!(verify_credential_binding(&credential, &expected).is_ok());
@@ -285,22 +331,94 @@ mod tests {
     }
 
     #[test]
-    fn provider_login_must_be_recent_and_nonce_bound() {
+    fn provider_login_must_be_recent() {
         let now = 2_000_000_000;
-        let recent = claims(now - 60, Some("fresh-login-nonce-123"), None);
+        let recent = claims(now - 60, None, None);
         assert!(enforce_recent_auth(&recent, &SocialProvider::Google, now).is_ok());
 
-        let stale = claims(
-            now - MAX_AUTH_AGE_SECONDS - 1,
-            Some("fresh-login-nonce-123"),
-            None,
-        );
+        let stale = claims(now - MAX_AUTH_AGE_SECONDS - 1, None, None);
         assert!(enforce_recent_auth(&stale, &SocialProvider::Google, now).is_err());
+    }
 
-        let missing_nonce = claims(now - 60, None, None);
-        assert!(
-            enforce_recent_auth(&missing_nonce, &SocialProvider::Apple, now).is_err()
+    const APP: &str = "0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f";
+    const SECRET: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
+
+    fn policy(provider: SocialProvider) -> RecoveryPolicy {
+        RecoveryPolicy {
+            app_id: APP.into(),
+            environment_id: "env".into(),
+            provider,
+            issuer: "issuer".into(),
+            audience: "audience".into(),
+            jwks_uri: "jwks".into(),
+        }
+    }
+
+    fn credential(provider: SocialProvider, secret: Option<&str>) -> ProviderCredential {
+        ProviderCredential {
+            provider,
+            id_token: "header.payload.signature".into(),
+            token_fingerprint: String::new(),
+            nonce_preimage: secret.map(str::to_owned),
+        }
+    }
+
+    fn bound_nonce(app: &str, secret: &str) -> String {
+        format!("{app}.{}", URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes())))
+    }
+
+    fn binding(provider: SocialProvider, nonce: Option<&str>, secret: Option<&str>) -> Result<()> {
+        verify_login_binding(
+            &claims(2_000_000_000, nonce, None),
+            &credential(provider.clone(), secret),
+            &policy(provider),
+        )
+    }
+
+    #[test]
+    fn hash_matches_the_pkce_s256_vector() {
+        // RFC 7636 Appendix B: this verifier hashes to this challenge.
+        assert_eq!(
+            URL_SAFE_NO_PAD.encode(Sha256::digest(SECRET.as_bytes())),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
         );
+    }
+
+    #[test]
+    fn token_must_carry_this_app_and_the_login_secret() {
+        let nonce = bound_nonce(APP, SECRET);
+        assert!(binding(SocialProvider::Google, Some(&nonce), Some(SECRET)).is_ok());
+
+        // Another app's login, for the same user and the same secret.
+        let other_app = bound_nonce("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", SECRET);
+        assert!(binding(SocialProvider::Google, Some(&other_app), Some(SECRET)).is_err());
+
+        // The token without the secret, or with someone else's.
+        assert!(binding(SocialProvider::Google, Some(&nonce), None).is_err());
+        let other_secret = "M25iVXpKU3puUjFaYWg3T1NDTDQtcW1ROUY5YXlwalNoc0hhakxifmZHag";
+        assert!(binding(SocialProvider::Google, Some(&nonce), Some(other_secret)).is_err());
+
+        // A short secret is refused even when it happens to match.
+        assert!(binding(SocialProvider::Google, Some(&bound_nonce(APP, "short")), Some("short"))
+            .is_err());
+
+        assert!(binding(SocialProvider::Google, None, Some(SECRET)).is_err());
+        // The app half alone, or the hash half alone, is not the nonce.
+        assert!(binding(SocialProvider::Google, Some(APP), Some(SECRET)).is_err());
+        let hash_only = nonce.split_once('.').unwrap().1;
+        assert!(binding(SocialProvider::Google, Some(hash_only), Some(SECRET)).is_err());
+    }
+
+    #[test]
+    fn apple_may_hash_the_nonce_and_google_may_not() {
+        let hashed = hex_sha256(bound_nonce(APP, SECRET).as_bytes());
+        assert!(binding(SocialProvider::Apple, Some(&hashed), Some(SECRET)).is_ok());
+        assert!(binding(SocialProvider::Google, Some(&hashed), Some(SECRET)).is_err());
+    }
+
+    #[test]
+    fn email_tokens_have_no_nonce_to_bind() {
+        assert!(binding(SocialProvider::Email, None, None).is_ok());
     }
 
     #[test]

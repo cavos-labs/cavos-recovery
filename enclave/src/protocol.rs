@@ -17,6 +17,12 @@ pub struct ProviderCredential {
     /// Base64url SHA-256 of `id_token`. The control plane stores only a second
     /// SHA-256 of this value to enforce single use.
     pub token_fingerprint: String,
+    /// The secret whose hash the client sent as the login `nonce`. It never
+    /// leaves the client except inside this encrypted job, so holding the token
+    /// alone is not enough to use it. Required for Google and Apple; an email
+    /// token carries no nonce to check it against.
+    #[serde(default)]
+    pub nonce_preimage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -45,6 +51,17 @@ pub enum WorkloadJob {
         sealed_record_b64: String,
         authorizations: Vec<ChainAuthorization>,
         stellar_recipient_pubkey_b64: Option<String>,
+    },
+    /// Ask what an existing sealed record holds, without changing anything.
+    ///
+    /// The control plane stores the record and could otherwise answer this
+    /// itself. A client resuming an enrolment, or checking that it is still
+    /// protected, must hear it from the enclave instead.
+    Confirm {
+        credential: ProviderCredential,
+        sealed_record_b64: String,
+        /// The DEK this device holds, when the record is expected to seal one.
+        stellar_dek_b64: Option<String>,
     },
 }
 
@@ -93,6 +110,17 @@ pub enum WorkloadResult {
         authorizations: Vec<SignedAuthorization>,
         stellar_device_wrap_b64: Option<String>,
     },
+    /// The record belongs to the credential's identity and holds this authority.
+    Confirmed {
+        identity_commitment_hex: String,
+        policy_hash_hex: String,
+        recovery_pubkey_compressed_b64: String,
+        recovery_x_hex: String,
+        recovery_y_hex: String,
+        /// Whether the record seals the DEK the client sent. Absent when the
+        /// client sent none.
+        dek_matches: Option<bool>,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -118,6 +146,12 @@ pub enum SignedAuthorization {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EncryptedJob {
     pub client_public_key_b64: String,
+    pub nonce_b64: String,
+    pub ciphertext_b64: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SealedResult {
     pub nonce_b64: String,
     pub ciphertext_b64: String,
 }
@@ -183,7 +217,12 @@ pub enum EnclaveResponse {
         attestation_document_b64: String,
     },
     JobCompleted {
+        /// For the control plane, which persists parts of it. It is relayed in
+        /// the clear and so proves nothing to the client.
         result: WorkloadResult,
+        /// The same result sealed under the session's response key. This is the
+        /// copy the client acts on.
+        sealed_result: SealedResult,
     },
     Pong,
     /// A failure the parent may surface. Messages are deliberately coarse: a

@@ -33,8 +33,9 @@ pub enum Failure {
     /// checked on any job, and the one that hid an Apple/Google mix-up behind
     /// an opaque failure for as long as Apple support has existed.
     ProviderMismatch,
-    /// The token does not hash to the fingerprint beside it, or that
-    /// fingerprint is not the one this session was opened for.
+    /// The token does not hash to the fingerprint beside it, that fingerprint
+    /// is not the one this session was opened for, or the token's nonce does
+    /// not name this app and the login secret sent with it.
     CredentialBinding,
     /// The provider's key endpoint could not be reached or did not answer with
     /// a usable key set. Purely about the enclave's egress.
@@ -44,8 +45,7 @@ pub enum Failure {
     /// The signature is good but a claim is not: issuer, audience, expiry, or
     /// an unverified email identity.
     ClaimsRejected,
-    /// The authentication behind the token is too old, dated in the future, or
-    /// missing the nonce the provider was asked to bind.
+    /// The authentication behind the token is too old or dated in the future.
     AuthStale,
     /// No such session, or one already used. Sessions are single-use.
     SessionUnknown,

@@ -24,6 +24,10 @@ use crate::protocol::{
 };
 
 pub const CHANNEL_INFO: &[u8] = b"cavos-confidential-channel-v1";
+/// Domain separator for the key the enclave answers under. Same shared secret
+/// and salt as `CHANNEL_INFO`, different `info`, so the two directions never
+/// share a key (RFC 5869 §3.2; the construction is RFC 9180 §9.8).
+pub const RESPONSE_INFO: &[u8] = b"cavos-confidential-channel-v1/response";
 const STELLAR_ECIES_INFO: &[u8] = b"cavos-stellar-dek-ecies";
 const STARKNET_DOMAIN: &[u8] = b"CAVOS_SOC_REC_V1";
 const SOLANA_DOMAIN: &[u8] = b"cavos:schedule_social:v1";
@@ -106,24 +110,32 @@ impl ChannelKey {
         &self.public
     }
 
+    /// Open a job and derive the key its answer is sealed under.
+    ///
+    /// The answer has to be authenticated, not just the request: the parent and
+    /// the control plane relay both, and a result they could rewrite would let
+    /// them hand the browser a recovery public key of their own.
     pub fn decrypt(
         &self,
         client_public_key: &[u8],
         nonce: &[u8],
         ciphertext: &[u8],
         session_id: &str,
-    ) -> Result<Zeroizing<Vec<u8>>> {
+    ) -> Result<(Zeroizing<Vec<u8>>, ResponseKey)> {
         if nonce.len() != 12 {
             bail!("channel nonce must be 12 bytes");
         }
         let client_public =
             PublicKey::from_sec1_bytes(client_public_key).context("bad client P-256 key")?;
         let shared = self.secret.diffie_hellman(&client_public);
-        let mut key = [0u8; 32];
-        Hkdf::<Sha256>::new(Some(session_id.as_bytes()), shared.raw_secret_bytes())
-            .expand(CHANNEL_INFO, &mut key)
+        let hkdf = Hkdf::<Sha256>::new(Some(session_id.as_bytes()), shared.raw_secret_bytes());
+        let mut key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(CHANNEL_INFO, key.as_mut_slice())
             .map_err(|_| anyhow!("channel HKDF failed"))?;
-        let plaintext = Aes256Gcm::new_from_slice(&key)
+        let mut response_key = Zeroizing::new([0u8; 32]);
+        hkdf.expand(RESPONSE_INFO, response_key.as_mut_slice())
+            .map_err(|_| anyhow!("channel HKDF failed"))?;
+        let plaintext = Aes256Gcm::new_from_slice(key.as_slice())
             .expect("AES key size")
             .decrypt(
                 Nonce::from_slice(nonce),
@@ -133,8 +145,31 @@ impl ChannelKey {
                 },
             )
             .map_err(|_| anyhow!("channel authentication failed"))?;
-        key.fill(0);
-        Ok(Zeroizing::new(plaintext))
+        Ok((Zeroizing::new(plaintext), ResponseKey(response_key)))
+    }
+}
+
+/// The key one session's answer is sealed under. Single-use, like the session.
+pub struct ResponseKey(Zeroizing<[u8; 32]>);
+
+impl ResponseKey {
+    /// Seal `plaintext` for the client that sent the job. Returns the nonce and
+    /// the ciphertext; the session id is bound as associated data, as it is on
+    /// the request.
+    pub fn seal(&self, plaintext: &[u8], session_id: &str) -> Result<([u8; 12], Vec<u8>)> {
+        let mut nonce = [0u8; 12];
+        rand_core::RngCore::fill_bytes(&mut OsRng, &mut nonce);
+        let ciphertext = Aes256Gcm::new_from_slice(self.0.as_slice())
+            .expect("AES key size")
+            .encrypt(
+                Nonce::from_slice(&nonce),
+                Payload {
+                    msg: plaintext,
+                    aad: session_id.as_bytes(),
+                },
+            )
+            .map_err(|_| anyhow!("response sealing failed"))?;
+        Ok((nonce, ciphertext))
     }
 }
 
@@ -362,13 +397,30 @@ mod tests {
                 Payload { msg: plaintext, aad: session.as_bytes() },
             )
             .unwrap();
-        let opened = enclave
+        let (opened, response_key) = enclave
             .decrypt(client_public.as_bytes(), &nonce, &ciphertext, session)
             .unwrap();
         assert_eq!(opened.as_slice(), plaintext);
         assert!(enclave
             .decrypt(client_public.as_bytes(), &nonce, &ciphertext, "other-session")
             .is_err());
+
+        // The answer opens under the response key the client derives from the
+        // same exchange, and under nothing else.
+        let (response_nonce, sealed) = response_key.seal(b"{\"result\":\"enrolled\"}", session).unwrap();
+        let mut client_response_key = [0u8; 32];
+        Hkdf::<Sha256>::new(Some(session.as_bytes()), shared.raw_secret_bytes())
+            .expand(RESPONSE_INFO, &mut client_response_key)
+            .unwrap();
+        let open = |key: &[u8; 32], aad: &str| {
+            Aes256Gcm::new_from_slice(key).unwrap().decrypt(
+                Nonce::from_slice(&response_nonce),
+                Payload { msg: &sealed, aad: aad.as_bytes() },
+            )
+        };
+        assert_eq!(open(&client_response_key, session).unwrap(), b"{\"result\":\"enrolled\"}");
+        assert!(open(&key, session).is_err(), "the request key must not open the answer");
+        assert!(open(&client_response_key, "other-session").is_err());
     }
 
     #[test]

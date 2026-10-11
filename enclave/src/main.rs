@@ -39,10 +39,11 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use p256::{ecdsa::SigningKey, SecretKey};
 use protocol::{
-    EnclaveConfig, EnclaveRequest, EnclaveResponse, EncryptedJob, SealedRecoveryRecord, WorkloadJob,
-    WorkloadResult,
+    EnclaveConfig, EnclaveRequest, EnclaveResponse, EncryptedJob, ProviderCredential,
+    SealedRecoveryRecord, SealedResult, WorkloadJob, WorkloadResult,
 };
 use reqwest::Client;
+use subtle::ConstantTimeEq;
 use tokio::sync::Mutex;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 use zeroize::Zeroizing;
@@ -267,11 +268,19 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
                     .map_err(|_| anyhow!("unknown, expired, or already-used session"))
                     .context(failure::Failure::SessionUnknown)?
             };
-            let plaintext = decrypt_job(&channel, &session_id, job)?;
+            let (plaintext, response_key) = decrypt_job(&channel, &session_id, job)?;
             let job: WorkloadJob =
                 serde_json::from_slice(&plaintext).context("invalid recovery job")?;
             let result = process_job(enclave, job, &auth_challenge_hash).await?;
-            Ok(EnclaveResponse::JobCompleted { result })
+            let (nonce, ciphertext) =
+                response_key.seal(&serde_json::to_vec(&result)?, &session_id)?;
+            Ok(EnclaveResponse::JobCompleted {
+                result,
+                sealed_result: SealedResult {
+                    nonce_b64: crypto::b64(nonce),
+                    ciphertext_b64: crypto::b64(ciphertext),
+                },
+            })
         }
     }
 }
@@ -295,7 +304,7 @@ fn decrypt_job(
     channel: &crypto::ChannelKey,
     session_id: &str,
     job: EncryptedJob,
-) -> Result<Zeroizing<Vec<u8>>> {
+) -> Result<(Zeroizing<Vec<u8>>, crypto::ResponseKey)> {
     channel.decrypt(
         &crypto::unb64(&job.client_public_key_b64)?,
         &crypto::unb64(&job.nonce_b64)?,
@@ -354,30 +363,8 @@ async fn process_job(
             authorizations,
             stellar_recipient_pubkey_b64,
         } => {
-            let record_bytes = enclave.root.unseal(&crypto::unb64(&sealed_record_b64)?)?;
-            let record: SealedRecoveryRecord =
-                serde_json::from_slice(&record_bytes).context("invalid sealed recovery record")?;
-            if record.version != 1 || credential.provider != record.policy.provider {
-                return Err(anyhow!("sealed recovery policy mismatch")
-                    .context(failure::Failure::ProviderMismatch));
-            }
-
-            let claims = oidc::verify_id_token(
-                &enclave.http,
-                &credential,
-                &record.policy,
-                auth_challenge_hash,
-            )
-            .await?;
-            let identity = crypto::identity_commitment(&record.policy, &claims.sub);
-            if crypto::hex(&identity) != record.identity_commitment_hex {
-                bail!("social identity does not match enrolled identity");
-            }
-
-            let secret_bytes = Zeroizing::new(crypto::unb64(&record.recovery_private_key_b64)?);
-            let secret = SecretKey::from_slice(&secret_bytes)
-                .context("invalid sealed recovery private key")?;
-            let signing_key = SigningKey::from(secret);
+            let (record, signing_key) =
+                open_record(enclave, &credential, &sealed_record_b64, auth_challenge_hash).await?;
 
             let mut signed = Vec::with_capacity(authorizations.len());
             for authorization in &authorizations {
@@ -395,12 +382,73 @@ async fn process_job(
                 };
 
             Ok(WorkloadResult::Recovered {
-                identity_commitment_hex: crypto::hex(&identity),
+                identity_commitment_hex: record.identity_commitment_hex,
                 authorizations: signed,
                 stellar_device_wrap_b64,
             })
         }
+
+        WorkloadJob::Confirm { credential, sealed_record_b64, stellar_dek_b64 } => {
+            let (record, signing_key) =
+                open_record(enclave, &credential, &sealed_record_b64, auth_challenge_hash).await?;
+            let (compressed, x, y) = crypto::recovery_public_parts(&signing_key);
+            let dek_matches = match stellar_dek_b64 {
+                None => None,
+                Some(claimed) => {
+                    let claimed = Zeroizing::new(crypto::unb64(&claimed)?);
+                    let sealed = record
+                        .stellar_dek_b64
+                        .as_deref()
+                        .map(crypto::unb64)
+                        .transpose()?
+                        .map(Zeroizing::new);
+                    Some(sealed.is_some_and(|sealed| {
+                        bool::from(sealed.as_slice().ct_eq(claimed.as_slice()))
+                    }))
+                }
+            };
+            Ok(WorkloadResult::Confirmed {
+                identity_commitment_hex: record.identity_commitment_hex,
+                policy_hash_hex: crypto::hex(&crypto::policy_hash(&record.policy)),
+                recovery_pubkey_compressed_b64: crypto::b64(compressed),
+                recovery_x_hex: crypto::hex(&x),
+                recovery_y_hex: crypto::hex(&y),
+                dek_matches,
+            })
+        }
     }
+}
+
+/// Unseal a record and prove the credential is the identity it was sealed for.
+///
+/// Everything a job may do with a record — sign with its key, release its DEK,
+/// or only describe it — comes after this, so no path can skip the check.
+async fn open_record(
+    enclave: &Enclave,
+    credential: &ProviderCredential,
+    sealed_record_b64: &str,
+    auth_challenge_hash: &str,
+) -> Result<(SealedRecoveryRecord, SigningKey)> {
+    let record_bytes = enclave.root.unseal(&crypto::unb64(sealed_record_b64)?)?;
+    let record: SealedRecoveryRecord =
+        serde_json::from_slice(&record_bytes).context("invalid sealed recovery record")?;
+    if record.version != 1 || credential.provider != record.policy.provider {
+        return Err(anyhow!("sealed recovery policy mismatch")
+            .context(failure::Failure::ProviderMismatch));
+    }
+
+    let claims =
+        oidc::verify_id_token(&enclave.http, credential, &record.policy, auth_challenge_hash)
+            .await?;
+    let identity = crypto::identity_commitment(&record.policy, &claims.sub);
+    if crypto::hex(&identity) != record.identity_commitment_hex {
+        bail!("social identity does not match enrolled identity");
+    }
+
+    let secret_bytes = Zeroizing::new(crypto::unb64(&record.recovery_private_key_b64)?);
+    let secret =
+        SecretKey::from_slice(&secret_bytes).context("invalid sealed recovery private key")?;
+    Ok((record, SigningKey::from(secret)))
 }
 
 #[cfg(test)]

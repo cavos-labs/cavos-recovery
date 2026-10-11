@@ -76,7 +76,7 @@ variable "enclave_pcr0" {
     KMS, so an enclave nobody accepts is one nobody can reach.
   EOT
   type        = string
-  default     = "3a97720a6e8a7a0ce034703be64d12e6ceadabdedf807656df6516770848da70f9f3a69ba355ccd4d1b1fc7ac3116aa4"
+  default     = "5ec163560006f105b5448c2db77ecf5ec442e00abd475f65349d6d93e837279652708770c50b3aa2e8676f553f572825"
 
   validation {
     condition     = can(regex("^[0-9a-f]{96}$", var.enclave_pcr0))

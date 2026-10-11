@@ -83,8 +83,12 @@ resource "aws_kms_key" "root" {
         Sid       = "AllowAccountAdministration"
         Effect    = "Allow"
         Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
+        # `kms:CreateAlias` rather than `kms:Create*`: the wildcard also covers
+        # `kms:CreateGrant`, and a grant can allow Decrypt with no attestation
+        # condition at all — grant constraints are limited to encryption
+        # context and source ARN.
         Action = [
-          "kms:Create*", "kms:Describe*", "kms:Enable*", "kms:List*",
+          "kms:CreateAlias", "kms:Describe*", "kms:Enable*", "kms:List*",
           "kms:Put*", "kms:Update*", "kms:Revoke*", "kms:Disable*",
           "kms:Get*", "kms:Delete*", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion",
         ]
@@ -97,8 +101,10 @@ resource "aws_kms_key" "root" {
         Sid       = "AllowRootKeyCreation"
         Effect    = "Allow"
         Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
-        Action    = ["kms:GenerateDataKeyWithoutPlaintext", "kms:Encrypt"]
-        Resource  = "*"
+        # No `kms:Encrypt`: with it, an account principal could wrap a root key
+        # of its own choosing and have the enclave seal new records under it.
+        Action   = ["kms:GenerateDataKeyWithoutPlaintext"]
+        Resource = "*"
       },
       {
         Sid       = "AllowDecryptOnlyFromTheAttestedEnclave"

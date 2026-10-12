@@ -23,6 +23,7 @@
 //! refused much later.
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -117,6 +118,49 @@ pub async fn start_forwarder(host: ProxiedHost) -> Result<()> {
             });
         }
     });
+    Ok(())
+}
+
+/// vsock port on the parent that opens an SMTP connection to the MX host named
+/// in the first frame.
+pub const SMTP_VSOCK_PORT: u32 = 8025;
+
+const SMTP_TUNNEL_ACCEPT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Open a one-shot loopback tunnel to `mx_host` on port 25 through the parent.
+///
+/// Returns the loopback address to connect to. The first connection accepted
+/// there is spliced to the parent's SMTP vsock port after sending the host name
+/// in one frame; the listener is then gone. TLS is negotiated by the caller end
+/// to end with the MX, so the parent relays ciphertext it cannot alter.
+pub async fn open_smtp_tunnel(mx_host: &str) -> Result<SocketAddr> {
+    let listener = TcpListener::bind(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)))
+        .await
+        .context("could not bind the SMTP tunnel")?;
+    let address = listener.local_addr()?;
+    let host = mx_host.to_owned();
+
+    tokio::spawn(async move {
+        let accepted = tokio::time::timeout(SMTP_TUNNEL_ACCEPT_TIMEOUT, listener.accept()).await;
+        let Ok(Ok((inbound, _))) = accepted else {
+            return;
+        };
+        drop(listener);
+        if let Err(error) = splice_smtp(inbound, SMTP_VSOCK_PORT, &host).await {
+            eprintln!("[outbound] SMTP tunnel ended: {error}");
+        }
+    });
+    Ok(address)
+}
+
+async fn splice_smtp(mut inbound: TcpStream, vsock_port: u32, mx_host: &str) -> Result<()> {
+    let mut outbound = VsockStream::connect(VsockAddr::new(PARENT_CID, vsock_port))
+        .await
+        .context("parent SMTP service unavailable")?;
+    write_frame(&mut outbound, mx_host.as_bytes()).await?;
+    tokio::io::copy_bidirectional(&mut inbound, &mut outbound)
+        .await
+        .context("SMTP relay failed")?;
     Ok(())
 }
 

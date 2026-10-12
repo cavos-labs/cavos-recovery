@@ -165,7 +165,7 @@ Wants=network-online.target
 
 [Service]
 ExecStartPre=/bin/bash -c 'aws ssm get-parameter --name ${relay_secret_param} --with-decryption --region $REGION --query Parameter.Value --output text > /run/cavos-relay-secret'
-ExecStart=/bin/bash -c 'CAVOS_RELAY_SHARED_SECRET=\$(cat /run/cavos-relay-secret) CAVOS_ENCLAVE_CID=16 CAVOS_RELAY_BIND=127.0.0.1:8080 AWS_REGION=$REGION CAVOS_ROOT_KEY_PARAM=${root_key_param} /opt/cavos/relay'
+ExecStart=/bin/bash -c 'CAVOS_RELAY_SHARED_SECRET=\$(cat /run/cavos-relay-secret) CAVOS_ENCLAVE_CID=16 CAVOS_RELAY_BIND=127.0.0.1:8080 AWS_REGION=$REGION CAVOS_ROOT_KEY_PARAM=${root_key_param} %{ if mail_from != "" }CAVOS_MAIL_FROM="${mail_from}" CAVOS_MAIL_SENDER="${mail_sender}" CAVOS_MAIL_HELO="${mail_helo}" CAVOS_MAIL_DKIM_SELECTOR="${mail_dkim_selector}" CAVOS_MAIL_DKIM_KEY_PARAM="${mail_dkim_key_param}" %{ endif }/opt/cavos/relay'
 Restart=always
 RestartSec=5
 # The relay holds nothing worth protecting, but there is no reason to give it

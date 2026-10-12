@@ -49,6 +49,17 @@ pub enum Failure {
     AuthStale,
     /// No such session, or one already used. Sessions are single-use.
     SessionUnknown,
+    /// The address, app id or app name sent with a code request is malformed.
+    EmailInvalid,
+    /// This enclave has no mail identity configured.
+    EmailUnavailable,
+    /// The recipient's domain has no usable MTA-STS policy or MX, or the mail
+    /// could not be handed to it.
+    EmailUndeliverable,
+    /// A code was already sent to this address within the last minute.
+    CodeCooldown,
+    /// The code is wrong, expired, used up, or was never requested.
+    CodeRejected,
 }
 
 impl Failure {
@@ -64,6 +75,11 @@ impl Failure {
             Failure::ClaimsRejected => "claims_rejected",
             Failure::AuthStale => "auth_stale",
             Failure::SessionUnknown => "session_unknown",
+            Failure::EmailInvalid => "email_invalid",
+            Failure::EmailUnavailable => "email_unavailable",
+            Failure::EmailUndeliverable => "email_undeliverable",
+            Failure::CodeCooldown => "code_cooldown",
+            Failure::CodeRejected => "code_rejected",
         }
     }
 }
@@ -121,6 +137,11 @@ mod tests {
             Failure::ClaimsRejected,
             Failure::AuthStale,
             Failure::SessionUnknown,
+            Failure::EmailInvalid,
+            Failure::EmailUnavailable,
+            Failure::EmailUndeliverable,
+            Failure::CodeCooldown,
+            Failure::CodeRejected,
         ];
         let mut codes: Vec<_> = all.iter().map(|f| f.code()).collect();
         codes.sort_unstable();

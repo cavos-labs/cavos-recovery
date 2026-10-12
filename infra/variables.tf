@@ -126,3 +126,34 @@ variable "host_count" {
     error_message = "The enclave host is a singleton: 0 or 1."
   }
 }
+
+variable "mail_from" {
+  description = <<-EOT
+    Visible From address for login codes, e.g. `no-reply@cavos.xyz`. The display
+    name beside it is the app the user is signing in to.
+    Empty (the default) turns code delivery off: the relay sends the enclave no
+    mail configuration and `send_code` answers `email_unavailable`. Setting it
+    makes `mail_sender`, `mail_helo` and `mail_dkim_selector` required, and
+    creates the SecureString parameter that must then hold the DKIM private key.
+  EOT
+  type        = string
+  default     = ""
+}
+
+variable "mail_sender" {
+  description = "Envelope sender (the address SPF checks) for login codes. Required when mail_from is set."
+  type        = string
+  default     = ""
+}
+
+variable "mail_helo" {
+  description = "Hostname announced in EHLO. Should be the host in the sending IP's PTR and SPF records. Required when mail_from is set."
+  type        = string
+  default     = ""
+}
+
+variable "mail_dkim_selector" {
+  description = "DKIM selector whose public key is published under the mail_sender domain. Required when mail_from is set."
+  type        = string
+  default     = ""
+}

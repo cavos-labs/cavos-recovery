@@ -31,7 +31,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context, Result};
 use axum::extract::State;
-use axum::http::{HeaderMap, StatusCode};
+use axum::http::{header, HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
@@ -40,6 +40,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpListener;
 use tokio_vsock::{VsockAddr, VsockListener, VsockStream, VMADDR_CID_ANY};
 
+mod smtp;
 mod sni;
 
 /// vsock port the enclave listens on. Must match the enclave's `SERVICE_PORT`.
@@ -68,6 +69,10 @@ const LOG_PORT: u32 = 5007;
 /// dialed at `www.googleapis.com`. See `sni`.
 const OUTBOUND_PORT: u32 = 8001;
 
+/// vsock port the enclave opens outbound SMTP on. Must match the enclave's
+/// `SMTP_VSOCK_PORT`.
+const SMTP_PORT: u32 = 8025;
+
 /// Ceiling on a response frame from the enclave. Matches the enclave's own
 /// inbound limit, so neither side can be made to allocate without bound.
 const MAX_FRAME_BYTES: u32 = 256 * 1024;
@@ -76,6 +81,10 @@ const MAX_FRAME_BYTES: u32 = 256 * 1024;
 /// milliseconds; anything approaching this means it is wedged, and failing fast
 /// is better than holding the control plane's request open.
 const ENCLAVE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// Sending a code involves two HTTPS fetches and an SMTP exchange with a
+/// stranger's mail server, so it is given far longer than anything else.
+const SEND_CODE_TIMEOUT: Duration = Duration::from_secs(30);
 
 struct Relay {
     enclave_cid: u32,
@@ -92,6 +101,7 @@ async fn main() -> Result<()> {
         )
         .init();
 
+    let mail = MailSettings::from_env()?;
     let relay = Arc::new(Relay {
         enclave_cid: required("CAVOS_ENCLAVE_CID")?
             .parse()
@@ -111,12 +121,14 @@ async fn main() -> Result<()> {
         // beyond checking they are JSON.
         .route("/sessions", post(open_session))
         .route("/jobs", post(run_job))
+        .route("/codes", post(send_code))
+        .route("/.well-known/jwks.json", get(jwks))
         .with_state(Arc::clone(&relay));
 
     // Serve the enclave's configuration before it starts. Only the enclave can
     // reach this: vsock is not routable from anywhere else.
     tokio::spawn(async move {
-        if let Err(error) = serve_config().await {
+        if let Err(error) = serve_config(mail).await {
             tracing::error!(%error, "configuration service stopped");
         }
     });
@@ -131,6 +143,12 @@ async fn main() -> Result<()> {
     tokio::spawn(async move {
         if let Err(error) = sni::serve(OUTBOUND_PORT).await {
             tracing::error!(%error, "outbound TLS forwarder stopped");
+        }
+    });
+
+    tokio::spawn(async move {
+        if let Err(error) = smtp::serve(SMTP_PORT).await {
+            tracing::error!(%error, "outbound SMTP forwarder stopped");
         }
     });
 
@@ -180,7 +198,7 @@ async fn serve_enclave_log() -> Result<()> {
 ///
 /// The values are read fresh each time rather than cached, so restarting the
 /// enclave picks up rotated instance credentials without restarting the relay.
-async fn serve_config() -> Result<()> {
+async fn serve_config(mail: Option<MailSettings>) -> Result<()> {
     let region = required("AWS_REGION")?;
     let root_key_param = required("CAVOS_ROOT_KEY_PARAM")?;
 
@@ -192,6 +210,7 @@ async fn serve_config() -> Result<()> {
         let (mut stream, _) = listener.accept().await?;
         let region = region.clone();
         let root_key_param = root_key_param.clone();
+        let mail = mail.clone();
 
         tokio::spawn(async move {
             let result = async {
@@ -205,7 +224,7 @@ async fn serve_config() -> Result<()> {
                 let mut discard = vec![0u8; length as usize];
                 stream.read_exact(&mut discard).await?;
 
-                let config = load_config(&region, &root_key_param).await?;
+                let config = load_config(&region, &root_key_param, mail.as_ref()).await?;
                 let body = serde_json::to_vec(&config)?;
                 let length = u32::try_from(body.len())?;
                 stream.write_all(&length.to_be_bytes()).await?;
@@ -229,6 +248,56 @@ struct EnclaveConfig {
     access_key_id: String,
     secret_access_key: String,
     session_token: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    mail: Option<MailConfig>,
+}
+
+#[derive(serde::Serialize)]
+struct MailConfig {
+    from: String,
+    sender: String,
+    helo: String,
+    dkim_selector: String,
+    dkim_private_key_pem: String,
+}
+
+/// The mail identity the host was started with. The DKIM private key is not
+/// here: only the name of the SecureString parameter that holds it is, and the
+/// key is read fresh whenever the enclave asks for its configuration.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MailSettings {
+    from: String,
+    sender: String,
+    helo: String,
+    dkim_selector: String,
+    dkim_key_param: String,
+}
+
+impl MailSettings {
+    fn from_env() -> Result<Option<Self>> {
+        Self::from_lookup(|name| std::env::var(name).ok())
+    }
+
+    /// No `CAVOS_MAIL_FROM` means this host sends no mail. With it, every other
+    /// variable is required: a half-configured sender would otherwise fail only
+    /// when a user asked for a code.
+    fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Result<Option<Self>> {
+        let Some(from) = get("CAVOS_MAIL_FROM").filter(|value| !value.is_empty()) else {
+            return Ok(None);
+        };
+        let need = |name: &str| {
+            get(name)
+                .filter(|value| !value.is_empty())
+                .with_context(|| format!("{name} is required when CAVOS_MAIL_FROM is set"))
+        };
+        Ok(Some(Self {
+            from,
+            sender: need("CAVOS_MAIL_SENDER")?,
+            helo: need("CAVOS_MAIL_HELO")?,
+            dkim_selector: need("CAVOS_MAIL_DKIM_SELECTOR")?,
+            dkim_key_param: need("CAVOS_MAIL_DKIM_KEY_PARAM")?,
+        }))
+    }
 }
 
 /// Gather what the enclave needs: the wrapped root key from Parameter Store,
@@ -237,25 +306,44 @@ struct EnclaveConfig {
 /// Handing over credentials is safe because they are not authority on their
 /// own. The KMS key policy releases the root key only against an attestation
 /// measuring to the published enclave image, which this process cannot produce.
-async fn load_config(region: &str, root_key_param: &str) -> Result<EnclaveConfig> {
-    let wrapped = ssm_parameter(region, root_key_param).await?;
+async fn load_config(
+    region: &str,
+    root_key_param: &str,
+    mail: Option<&MailSettings>,
+) -> Result<EnclaveConfig> {
+    let wrapped = ssm_parameter(region, root_key_param, false).await?;
     let creds = imds_credentials().await?;
+    let mail = match mail {
+        Some(settings) => Some(MailConfig {
+            from: settings.from.clone(),
+            sender: settings.sender.clone(),
+            helo: settings.helo.clone(),
+            dkim_selector: settings.dkim_selector.clone(),
+            dkim_private_key_pem: ssm_parameter(region, &settings.dkim_key_param, true).await?,
+        }),
+        None => None,
+    };
     Ok(EnclaveConfig {
         region: region.to_string(),
         wrapped_root_key_b64: wrapped,
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,
         session_token: Some(creds.token),
+        mail,
     })
 }
 
-async fn ssm_parameter(region: &str, name: &str) -> Result<String> {
+async fn ssm_parameter(region: &str, name: &str, decrypt: bool) -> Result<String> {
     // Shelling out to the AWS CLI keeps SigV4 and credential resolution out of
     // this binary. The relay is untrusted, so there is nothing to gain by
     // hardening it; simplicity is worth more here.
-    let output = tokio::process::Command::new("aws")
-        .args(["ssm", "get-parameter", "--name", name, "--region", region,
-               "--query", "Parameter.Value", "--output", "text"])
+    let mut command = tokio::process::Command::new("aws");
+    command.args(["ssm", "get-parameter", "--name", name, "--region", region,
+                  "--query", "Parameter.Value", "--output", "text"]);
+    if decrypt {
+        command.arg("--with-decryption");
+    }
+    let output = command
         .output()
         .await
         .context("could not run the AWS CLI")?;
@@ -346,15 +434,58 @@ async fn run_job(
     forward(relay, headers, "run_job", body).await
 }
 
+async fn send_code(
+    State(relay): State<Arc<Relay>>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Response {
+    forward_within(relay, headers, "send_code", body, SEND_CODE_TIMEOUT).await
+}
+
+/// The signing keys for tokens the enclave issues, as a bare JWKS document.
+/// Public by design: it is what lets anyone verify those tokens.
+async fn jwks(State(relay): State<Arc<Relay>>) -> Response {
+    match relay.call(&serde_json::json!({ "request": "login_keys" })).await {
+        Ok(response) => match jwks_document(&response) {
+            Some(document) => (
+                StatusCode::OK,
+                [(header::CACHE_CONTROL, "public, max-age=300")],
+                Json(document.clone()),
+            )
+                .into_response(),
+            None => {
+                tracing::error!("enclave answered login_keys with something else");
+                (StatusCode::BAD_GATEWAY, "enclave call failed").into_response()
+            }
+        },
+        Err(error) => {
+            tracing::error!(%error, "enclave login_keys call failed");
+            (StatusCode::BAD_GATEWAY, "enclave call failed").into_response()
+        }
+    }
+}
+
+fn jwks_document(response: &Value) -> Option<&Value> {
+    if response.get("response").and_then(Value::as_str) != Some("login_keys") {
+        return None;
+    }
+    response.get("jwks").filter(|jwks| jwks.get("keys").is_some_and(Value::is_array))
+}
+
 /// Tag the caller's body with the request kind and hand it to the enclave.
 ///
 /// The relay sets `request` itself rather than trusting the body, so a caller
 /// cannot reach a different enclave operation than the route it posted to.
-async fn forward(
+async fn forward(relay: Arc<Relay>, headers: HeaderMap, request: &str, body: Value) -> Response {
+    forward_within(relay, headers, request, body, ENCLAVE_TIMEOUT).await
+}
+
+async fn forward_within(
     relay: Arc<Relay>,
     headers: HeaderMap,
     request: &str,
     mut body: Value,
+    timeout: Duration,
 ) -> Response {
     if !authorized(&relay, &headers) {
         return (StatusCode::UNAUTHORIZED, "unauthorized").into_response();
@@ -364,7 +495,7 @@ async fn forward(
     };
     object.insert("request".into(), Value::String(request.into()));
 
-    match relay.call(&body).await {
+    match relay.call_within(&body, timeout).await {
         Ok(response) => (StatusCode::OK, Json(response)).into_response(),
         Err(error) => {
             // The enclave's own errors are already coarse by design; anything
@@ -404,9 +535,13 @@ impl Relay {
     /// One request, one vsock connection. Connections are cheap and this avoids
     /// having to reason about a pooled stream left half-written by a timeout.
     async fn call(&self, request: &Value) -> Result<Value> {
-        tokio::time::timeout(ENCLAVE_TIMEOUT, self.exchange(request))
+        self.call_within(request, ENCLAVE_TIMEOUT).await
+    }
+
+    async fn call_within(&self, request: &Value, timeout: Duration) -> Result<Value> {
+        tokio::time::timeout(timeout, self.exchange(request))
             .await
-            .map_err(|_| anyhow::anyhow!("enclave did not answer within {ENCLAVE_TIMEOUT:?}"))?
+            .map_err(|_| anyhow::anyhow!("enclave did not answer within {timeout:?}"))?
     }
 
     async fn exchange(&self, request: &Value) -> Result<Value> {
@@ -457,6 +592,65 @@ mod tests {
     #[test]
     fn accepts_the_configured_secret() {
         assert!(authorized(&relay(), &headers_with("correct-horse")));
+    }
+
+    fn lookup<'a>(pairs: &'a [(&'a str, &'a str)]) -> impl Fn(&str) -> Option<String> + 'a {
+        move |name| pairs.iter().find(|(key, _)| *key == name).map(|(_, value)| value.to_string())
+    }
+
+    const FULL_MAIL: &[(&str, &str)] = &[
+        ("CAVOS_MAIL_FROM", "login@mail.cavos.xyz"),
+        ("CAVOS_MAIL_SENDER", "bounce@mail.cavos.xyz"),
+        ("CAVOS_MAIL_HELO", "mail.cavos.xyz"),
+        ("CAVOS_MAIL_DKIM_SELECTOR", "s1"),
+        ("CAVOS_MAIL_DKIM_KEY_PARAM", "/cavos/dkim"),
+    ];
+
+    #[test]
+    fn no_mail_variables_means_no_mail() {
+        assert_eq!(MailSettings::from_lookup(lookup(&[])).unwrap(), None);
+        assert_eq!(
+            MailSettings::from_lookup(lookup(&[("CAVOS_MAIL_FROM", "")])).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn a_full_mail_configuration_is_read() {
+        let settings = MailSettings::from_lookup(lookup(FULL_MAIL)).unwrap().unwrap();
+        assert_eq!(settings.helo, "mail.cavos.xyz");
+        assert_eq!(settings.dkim_key_param, "/cavos/dkim");
+    }
+
+    #[test]
+    fn a_partial_mail_configuration_fails_loudly() {
+        for (index, (missing, _)) in FULL_MAIL.iter().enumerate().skip(1) {
+            let partial: Vec<_> = FULL_MAIL
+                .iter()
+                .enumerate()
+                .filter(|(other, _)| *other != index)
+                .map(|(_, pair)| *pair)
+                .collect();
+            let error = MailSettings::from_lookup(lookup(&partial)).unwrap_err();
+            assert!(error.to_string().contains(missing), "{error}");
+        }
+    }
+
+    #[test]
+    fn the_jwks_route_returns_only_the_bare_document() {
+        let answer = serde_json::json!({
+            "response": "login_keys",
+            "jwks": { "keys": [{ "kty": "EC" }] }
+        });
+        assert_eq!(
+            jwks_document(&answer),
+            Some(&serde_json::json!({ "keys": [{ "kty": "EC" }] }))
+        );
+        assert_eq!(jwks_document(&serde_json::json!({ "response": "error", "code": "x" })), None);
+        assert_eq!(
+            jwks_document(&serde_json::json!({ "response": "login_keys", "jwks": {} })),
+            None
+        );
     }
 
     #[test]

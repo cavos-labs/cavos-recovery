@@ -19,8 +19,7 @@ pub struct ProviderCredential {
     pub token_fingerprint: String,
     /// The secret whose hash the client sent as the login `nonce`. It never
     /// leaves the client except inside this encrypted job, so holding the token
-    /// alone is not enough to use it. Required for Google and Apple; an email
-    /// token carries no nonce to check it against.
+    /// alone is not enough to use it. Required for every provider.
     #[serde(default)]
     pub nonce_preimage: Option<String>,
 }
@@ -62,6 +61,12 @@ pub enum WorkloadJob {
         sealed_record_b64: String,
         /// The DEK this device holds, when the record is expected to seal one.
         stellar_dek_b64: Option<String>,
+    },
+    /// Trade the code the enclave mailed for a token signed by the enclave.
+    VerifyEmail {
+        email: String,
+        code: String,
+        client_nonce: String,
     },
 }
 
@@ -121,6 +126,9 @@ pub enum WorkloadResult {
         /// client sent none.
         dek_matches: Option<bool>,
     },
+    EmailVerified {
+        id_token: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +186,19 @@ pub struct EnclaveConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+    /// Absent when the host has no mail identity; sending codes is then refused
+    /// and everything else is unaffected.
+    #[serde(default)]
+    pub mail: Option<MailConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailConfig {
+    pub from: String,
+    pub sender: String,
+    pub helo: String,
+    pub dkim_selector: String,
+    pub dkim_private_key_pem: String,
 }
 
 /// A request arriving over vsock from the parent instance.
@@ -197,8 +218,18 @@ pub enum EnclaveRequest {
         job: EncryptedJob,
         /// Base64url SHA-256 of the ID token, bound by the control plane to
         /// enforce single use. The enclave checks the credential matches it.
+        /// Not used by `verify_email`, which has no credential yet.
+        #[serde(default)]
         auth_challenge_hash: String,
     },
+    /// Generate a one-time code and mail it to `email`.
+    SendCode {
+        email: String,
+        app_id: String,
+        app_name: String,
+    },
+    /// The public keys that verify tokens this enclave issues.
+    LoginKeys,
     /// Liveness probe for the parent's health check. Reveals nothing.
     Ping,
 }
@@ -225,6 +256,10 @@ pub enum EnclaveResponse {
         sealed_result: SealedResult,
     },
     Pong,
+    CodeSent,
+    LoginKeys {
+        jwks: serde_json::Value,
+    },
     /// A failure the parent may surface. Messages are deliberately coarse: a
     /// detailed reason would leak facts about a user's credential to the
     /// untrusted relay.

@@ -47,8 +47,13 @@ libc = "0.2"
 # cheaper trade. See `kms::sigv4`.
 hmac = "0.12"
 
+lettre = { version = "0.11", default-features = false, features = ["builder", "smtp-transport", "tokio1-rustls-tls", "dkim"] }
+
 [dev-dependencies]
+rcgen = "0.13"
+tokio-rustls = { version = "0.26", default-features = false, features = ["ring"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
+rsa = { version = "0.9", features = ["pem"] }
 
 [profile.release]
 codegen-units = 1

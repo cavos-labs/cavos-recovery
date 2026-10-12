@@ -76,7 +76,7 @@ variable "enclave_pcr0" {
     KMS, so an enclave nobody accepts is one nobody can reach.
   EOT
   type        = string
-  default     = "5ec163560006f105b5448c2db77ecf5ec442e00abd475f65349d6d93e837279652708770c50b3aa2e8676f553f572825"
+  default     = "f388b0bf627bdad34968ebab083688b999da2aaa369a65323a3085725de0fc79d7cf0fab6527d57e06b4b10950a150f9"
 
   validation {
     condition     = can(regex("^[0-9a-f]{96}$", var.enclave_pcr0))
@@ -137,23 +137,23 @@ variable "mail_from" {
     creates the SecureString parameter that must then hold the DKIM private key.
   EOT
   type        = string
-  default     = ""
+  default     = "no-reply@cavos.xyz"
 }
 
 variable "mail_sender" {
   description = "Envelope sender (the address SPF checks) for login codes. Required when mail_from is set."
   type        = string
-  default     = ""
+  default     = "no-reply@mta.cavos.xyz"
 }
 
 variable "mail_helo" {
   description = "Hostname announced in EHLO. Should be the host in the sending IP's PTR and SPF records. Required when mail_from is set."
   type        = string
-  default     = ""
+  default     = "mta.cavos.xyz"
 }
 
 variable "mail_dkim_selector" {
   description = "DKIM selector whose public key is published under the mail_sender domain. Required when mail_from is set."
   type        = string
-  default     = ""
+  default     = "otp2"
 }

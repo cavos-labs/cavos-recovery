@@ -65,6 +65,8 @@ const RECORD_SEAL_INFO: &[u8] = b"cavos-record-seal-v1";
 const SEAL_SALT_LEN: usize = 32;
 /// AES-GCM nonce length.
 const SEAL_NONCE_LEN: usize = 12;
+/// Domain separator for the key that signs email login tokens.
+const LOGIN_KEY_INFO: &[u8] = b"cavos-email-login-key-v1";
 
 /// The enclave's long-lived sealing key. Never leaves the enclave, never logged.
 pub struct RootKey(Zeroizing<[u8; 32]>);
@@ -234,6 +236,17 @@ impl RootKey {
             )
             .map_err(|_| anyhow!("sealed record failed authentication"))?;
         Ok(Zeroizing::new(plaintext))
+    }
+
+    /// The P-256 key that signs email login tokens, derived from the root key so
+    /// it is the same after every restart.
+    pub fn login_signing_key(&self) -> Result<p256::SecretKey> {
+        let mut bytes = Zeroizing::new([0u8; 32]);
+        Hkdf::<Sha256>::new(None, self.0.as_slice())
+            .expand(LOGIN_KEY_INFO, bytes.as_mut_slice())
+            .map_err(|_| anyhow!("login key derivation failed"))?;
+        p256::SecretKey::from_slice(bytes.as_slice())
+            .map_err(|_| anyhow!("derived login key is not a valid P-256 scalar"))
     }
 
     fn derive(&self, salt: &[u8]) -> Result<Zeroizing<[u8; 32]>> {

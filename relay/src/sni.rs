@@ -46,15 +46,31 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 /// Hosts the enclave is allowed to reach through here.
 ///
-/// Every entry is a provider JWKS or discovery host. Adding a provider means
-/// adding it here — and, unlike the port-per-provider alternative, nothing in
-/// the measured image changes.
+/// The first four are provider JWKS or discovery hosts, and `github.com` and
+/// `api.github.com` are where the enclave redeems a GitHub authorization code.
+/// `dns.google` is the DNS-over-HTTPS resolver the enclave asks for a recipient
+/// domain's MX records when it mails a login code. Separately, any host
+/// starting with `mta-sts.` is allowed, because the enclave fetches the
+/// recipient domain's MTA-STS policy
+/// from `https://mta-sts.<domain>/.well-known/mta-sts.txt` and the domain is
+/// whatever address a user types. Adding a provider means adding it here — and,
+/// unlike the port-per-provider alternative, nothing in the measured image
+/// changes.
 const ALLOWED_HOSTS: &[&str] = &[
     "accounts.google.com",
     "www.googleapis.com",
     "appleid.apple.com",
     "securetoken.google.com",
+    "github.com",
+    "api.github.com",
+    "dns.google",
 ];
+
+const MTA_STS_PREFIX: &str = "mta-sts.";
+
+fn is_allowed(host: &str) -> bool {
+    ALLOWED_HOSTS.contains(&host) || host.starts_with(MTA_STS_PREFIX)
+}
 
 /// A ClientHello is small. This is far above any real one and well below
 /// anything that would let a peer make us buffer meaningfully.
@@ -105,7 +121,7 @@ async fn forward(mut enclave: tokio_vsock::VsockStream) -> Result<()> {
         }
     };
 
-    if !ALLOWED_HOSTS.contains(&host.as_str()) {
+    if !is_allowed(&host) {
         bail!("host {host} is not an allowed outbound destination");
     }
 
@@ -294,6 +310,22 @@ mod tests {
             let hello = client_hello(host);
             assert_eq!(server_name(&hello).unwrap().as_deref(), Some(*host));
         }
+    }
+
+    #[test]
+    fn allows_providers_dns_and_mta_sts_hosts_only() {
+        for host in ALLOWED_HOSTS {
+            assert!(is_allowed(host));
+        }
+        assert!(is_allowed("mta-sts.example.org"));
+        assert!(is_allowed("mta-sts.gmail.com"));
+        assert!(!is_allowed("example.org"));
+        assert!(!is_allowed("evilmta-sts.example.org"));
+        assert!(!is_allowed("mta-sts"));
+        assert!(!is_allowed("dns.google.evil.com"));
+        assert!(!is_allowed("github.com.evil.com"));
+        assert!(!is_allowed("gist.github.com"));
+        assert!(!is_allowed("169.254.169.254"));
     }
 
     #[test]

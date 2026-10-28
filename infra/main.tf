@@ -148,6 +148,24 @@ resource "aws_ssm_parameter" "wrapped_root_key" {
   }
 }
 
+resource "aws_ssm_parameter" "mail_dkim_key" {
+  count = var.mail_from == "" ? 0 : 1
+
+  name        = "/${local.name}/mail-dkim-key"
+  description = "PKCS#1 RSA private key (PEM) that DKIM-signs login mail"
+  type        = "SecureString"
+  value       = "PENDING_BOOTSTRAP"
+
+  lifecycle {
+    ignore_changes = [value]
+
+    precondition {
+      condition     = var.mail_sender != "" && var.mail_helo != "" && var.mail_dkim_selector != ""
+      error_message = "mail_sender, mail_helo and mail_dkim_selector are all required when mail_from is set."
+    }
+  }
+}
+
 resource "aws_ssm_parameter" "relay_secret" {
   name        = "/${local.name}/relay-secret"
   description = "Shared secret the control plane presents to the relay (abuse control)"
@@ -273,10 +291,13 @@ resource "aws_iam_role_policy" "instance" {
         Sid    = "ReadItsOwnConfiguration"
         Effect = "Allow"
         Action = ["ssm:GetParameter", "ssm:GetParameters"]
-        Resource = [
-          aws_ssm_parameter.wrapped_root_key.arn,
-          aws_ssm_parameter.relay_secret.arn,
-        ]
+        Resource = concat(
+          [
+            aws_ssm_parameter.wrapped_root_key.arn,
+            aws_ssm_parameter.relay_secret.arn,
+          ],
+          aws_ssm_parameter.mail_dkim_key[*].arn,
+        )
       },
       {
         # Note there is no kms:Decrypt here. The instance role is granted that
@@ -397,14 +418,19 @@ resource "aws_launch_template" "enclave_host" {
   }
 
   user_data = base64encode(templatefile("${path.module}/user-data.sh", {
-    region             = var.region
-    hostname           = var.hostname
-    artifacts_bucket   = aws_s3_bucket.artifacts.bucket
-    enclave_cpu_count  = var.enclave_cpu_count
-    enclave_memory_mib = var.enclave_memory_mib
-    root_key_param     = aws_ssm_parameter.wrapped_root_key.name
-    relay_secret_param = aws_ssm_parameter.relay_secret.name
-    eip_allocation_id  = aws_eip.instance.id
+    region              = var.region
+    hostname            = var.hostname
+    artifacts_bucket    = aws_s3_bucket.artifacts.bucket
+    enclave_cpu_count   = var.enclave_cpu_count
+    enclave_memory_mib  = var.enclave_memory_mib
+    root_key_param      = aws_ssm_parameter.wrapped_root_key.name
+    relay_secret_param  = aws_ssm_parameter.relay_secret.name
+    eip_allocation_id   = aws_eip.instance.id
+    mail_from           = var.mail_from
+    mail_sender         = var.mail_sender
+    mail_helo           = var.mail_helo
+    mail_dkim_selector  = var.mail_dkim_selector
+    mail_dkim_key_param = length(aws_ssm_parameter.mail_dkim_key) == 0 ? "" : aws_ssm_parameter.mail_dkim_key[0].name
   }))
 
   tag_specifications {

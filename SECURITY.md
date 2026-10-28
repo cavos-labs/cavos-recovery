@@ -5,7 +5,7 @@ This document is the threat-model note for `cavos-labs/cavos-recovery`. It is **
 
 ## What this is (and is not)
 
-Hardware-isolated social recovery lets a user who has lost every device sign in with a configured OIDC provider (Google, Apple, or Firebase email) and **authorize a new device signer**. Credential verification and the authorizing signature happen inside a measured AWS Nitro Enclave. The ID token is never handled in cleartext outside that enclave, including by Cavos.
+Hardware-isolated social recovery lets a user who has lost every device sign in with a configured identity provider (Google, Apple, GitHub, or email) and **authorize a new device signer**. Credential verification and the authorizing signature happen inside a measured AWS Nitro Enclave. The ID token is never handled in cleartext outside that enclave, including by Cavos.
 
 It is **opt-in** per Cavos environment. It is **separate from Essential on-device recovery** (passkey, recovery code, or enrolled device), which does not use this enclave. Day-to-day wallet signing is the on-device / on-chain device signer path and does not depend on the enclave host being up.
 

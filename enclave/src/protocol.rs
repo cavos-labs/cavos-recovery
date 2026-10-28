@@ -6,6 +6,7 @@ pub enum SocialProvider {
     Google,
     Apple,
     Email,
+    Github,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -19,8 +20,7 @@ pub struct ProviderCredential {
     pub token_fingerprint: String,
     /// The secret whose hash the client sent as the login `nonce`. It never
     /// leaves the client except inside this encrypted job, so holding the token
-    /// alone is not enough to use it. Required for Google and Apple; an email
-    /// token carries no nonce to check it against.
+    /// alone is not enough to use it. Required for every provider.
     #[serde(default)]
     pub nonce_preimage: Option<String>,
 }
@@ -62,6 +62,17 @@ pub enum WorkloadJob {
         sealed_record_b64: String,
         /// The DEK this device holds, when the record is expected to seal one.
         stellar_dek_b64: Option<String>,
+    },
+    /// Trade the code the enclave mailed for a token signed by the enclave.
+    VerifyEmail {
+        email: String,
+        code: String,
+        client_nonce: String,
+    },
+    /// Trade a GitHub authorization code for a token signed by the enclave.
+    VerifyGithub {
+        code_verifier: String,
+        client_nonce: String,
     },
 }
 
@@ -121,6 +132,36 @@ pub enum WorkloadResult {
         /// client sent none.
         dek_matches: Option<bool>,
     },
+    EmailVerified {
+        id_token: String,
+    },
+    GithubVerified {
+        id_token: String,
+    },
+}
+
+/// What the control plane supplies to redeem a GitHub authorization code. It
+/// is untrusted input: the client's `code_verifier`, which arrives inside the
+/// encrypted job, is what stops anyone but the client redeeming the code.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GithubGrant {
+    pub code: String,
+    pub app_id: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for GithubGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubGrant")
+            .field("code", &"<redacted>")
+            .field("app_id", &self.app_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -178,6 +219,19 @@ pub struct EnclaveConfig {
     pub access_key_id: String,
     pub secret_access_key: String,
     pub session_token: Option<String>,
+    /// Absent when the host has no mail identity; sending codes is then refused
+    /// and everything else is unaffected.
+    #[serde(default)]
+    pub mail: Option<MailConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MailConfig {
+    pub from: String,
+    pub sender: String,
+    pub helo: String,
+    pub dkim_selector: String,
+    pub dkim_private_key_pem: String,
 }
 
 /// A request arriving over vsock from the parent instance.
@@ -197,8 +251,22 @@ pub enum EnclaveRequest {
         job: EncryptedJob,
         /// Base64url SHA-256 of the ID token, bound by the control plane to
         /// enforce single use. The enclave checks the credential matches it.
+        /// Not used by `verify_email`, which has no credential yet.
+        #[serde(default)]
         auth_challenge_hash: String,
+        /// Supplied by the control plane, which bound the code to the app. Only
+        /// `verify_github` uses it.
+        #[serde(default)]
+        github: Option<GithubGrant>,
     },
+    /// Generate a one-time code and mail it to `email`.
+    SendCode {
+        email: String,
+        app_id: String,
+        app_name: String,
+    },
+    /// The public keys that verify tokens this enclave issues.
+    LoginKeys,
     /// Liveness probe for the parent's health check. Reveals nothing.
     Ping,
 }
@@ -225,6 +293,10 @@ pub enum EnclaveResponse {
         sealed_result: SealedResult,
     },
     Pong,
+    CodeSent,
+    LoginKeys {
+        jwks: serde_json::Value,
+    },
     /// A failure the parent may surface. Messages are deliberately coarse: a
     /// detailed reason would leak facts about a user's credential to the
     /// untrusted relay.

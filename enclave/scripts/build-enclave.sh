@@ -98,6 +98,10 @@ measurements=$(docker run --rm --platform "$PLATFORM" \
   "cavos-nitro-cli:$NITRO_CLI_VERSION" \
   nitro-cli build-enclave --docker-uri "$IMAGE" --output-file /out/enclave.eif)
 
+if [[ -n ${MEASUREMENTS_OUT:-} ]]; then
+  printf '%s\n' "$measurements" > "$MEASUREMENTS_OUT"
+fi
+
 pcr0=$(printf '%s' "$measurements" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR0"])')
 pcr1=$(printf '%s' "$measurements" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR1"])')
 pcr2=$(printf '%s' "$measurements" | python3 -c 'import json,sys; print(json.load(sys.stdin)["Measurements"]["PCR2"])')

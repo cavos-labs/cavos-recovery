@@ -1,6 +1,7 @@
 use anyhow::{anyhow, bail, Context, Result};
 
 use crate::failure::Failure;
+use crate::login::{self, LoginKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
     decode, decode_header,
@@ -32,14 +33,6 @@ pub struct IdentityClaims {
     pub nonce: Option<String>,
     #[serde(default)]
     pub email_verified: Option<serde_json::Value>,
-    #[serde(default)]
-    pub firebase: Option<FirebaseClaims>,
-}
-
-#[derive(Debug, Deserialize)]
-pub struct FirebaseClaims {
-    #[serde(default)]
-    pub sign_in_provider: Option<String>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -63,6 +56,7 @@ impl Audience {
 
 pub async fn verify_id_token(
     http: &reqwest::Client,
+    login: &LoginKey,
     credential: &ProviderCredential,
     policy: &RecoveryPolicy,
     expected_auth_challenge_hash: &str,
@@ -78,42 +72,15 @@ pub async fn verify_id_token(
         .kid
         .context("OIDC token omitted kid")
         .context(Failure::SignatureRejected)?;
-    let jwks: JwkSet = http
-        .get(&policy.jwks_uri)
-        .send()
-        .await
-        .context("JWKS request failed")
-        .context(Failure::JwksUnreachable)?
-        .error_for_status()
-        .context("JWKS endpoint rejected request")
-        .context(Failure::JwksUnreachable)?
-        .json()
-        .await
-        .context("invalid JWKS")
-        .context(Failure::JwksUnreachable)?;
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|key| key.common.key_id.as_deref() == Some(kid.as_str()))
-        .context("OIDC signing key not found")
-        .context(Failure::SignatureRejected)?;
-
-    let (algorithm, decoding_key) = match &jwk.algorithm {
-        AlgorithmParameters::RSA(rsa) => (
-            Algorithm::RS256,
-            DecodingKey::from_rsa_components(&rsa.n, &rsa.e)
-                .context("invalid RSA JWK")?,
-        ),
-        AlgorithmParameters::EllipticCurve(ec) => {
-            let x = URL_SAFE_NO_PAD.decode(&ec.x)?;
-            let y = URL_SAFE_NO_PAD.decode(&ec.y)?;
-            (
-                Algorithm::ES256,
-                DecodingKey::from_ec_components(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
-                    .context("invalid EC JWK")?,
-            )
+    let (algorithm, decoding_key) = match policy.provider {
+        SocialProvider::Email | SocialProvider::Github => {
+            if kid != login.kid() {
+                return Err(anyhow!("login token names an unknown key")
+                    .context(Failure::SignatureRejected));
+            }
+            (Algorithm::ES256, login.decoding_key()?)
         }
-        _ => bail!("unsupported OIDC signing key type"),
+        _ => provider_key(http, policy, &kid).await?,
     };
     if header.alg != algorithm {
         return Err(anyhow!("OIDC alg/key mismatch").context(Failure::SignatureRejected));
@@ -139,9 +106,54 @@ pub async fn verify_id_token(
     if matches!(policy.provider, SocialProvider::Email) && !email_verified {
         return Err(anyhow!("email identity is not verified").context(Failure::ClaimsRejected));
     }
-    enforce_recent_auth(&claims, &policy.provider, unix_time()?).context(Failure::AuthStale)?;
+    enforce_recent_auth(&claims, unix_time()?).context(Failure::AuthStale)?;
     verify_login_binding(&claims, credential, policy).context(Failure::CredentialBinding)?;
     Ok(claims)
+}
+
+async fn provider_key(
+    http: &reqwest::Client,
+    policy: &RecoveryPolicy,
+    kid: &str,
+) -> Result<(Algorithm, DecodingKey)> {
+    let jwks: JwkSet = http
+        .get(&policy.jwks_uri)
+        .send()
+        .await
+        .context("JWKS request failed")
+        .context(Failure::JwksUnreachable)?
+        .error_for_status()
+        .context("JWKS endpoint rejected request")
+        .context(Failure::JwksUnreachable)?
+        .json()
+        .await
+        .context("invalid JWKS")
+        .context(Failure::JwksUnreachable)?;
+    let jwk = jwks
+        .keys
+        .iter()
+        .find(|key| key.common.key_id.as_deref() == Some(kid))
+        .context("OIDC signing key not found")
+        .context(Failure::SignatureRejected)?;
+
+    let (algorithm, decoding_key) = match &jwk.algorithm {
+        AlgorithmParameters::RSA(rsa) => (
+            Algorithm::RS256,
+            DecodingKey::from_rsa_components(&rsa.n, &rsa.e)
+                .context("invalid RSA JWK")?,
+        ),
+        AlgorithmParameters::EllipticCurve(ec) => {
+            let x = URL_SAFE_NO_PAD.decode(&ec.x)?;
+            let y = URL_SAFE_NO_PAD.decode(&ec.y)?;
+            (
+                Algorithm::ES256,
+                DecodingKey::from_ec_components(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
+                    .context("invalid EC JWK")?,
+            )
+        }
+        _ => bail!("unsupported OIDC signing key type"),
+    };
+    Ok((algorithm, decoding_key))
 }
 
 /// Length of a base64url-encoded SHA-256, and the least a login secret may be.
@@ -169,10 +181,6 @@ fn verify_login_binding(
     credential: &ProviderCredential,
     policy: &RecoveryPolicy,
 ) -> Result<()> {
-    if matches!(policy.provider, SocialProvider::Email) {
-        // A Firebase email token has no nonce the login could have set.
-        return Ok(());
-    }
     let secret = credential
         .nonce_preimage
         .as_deref()
@@ -223,11 +231,7 @@ fn verify_credential_binding(
     Ok(())
 }
 
-fn enforce_recent_auth(
-    claims: &IdentityClaims,
-    provider: &SocialProvider,
-    now: u64,
-) -> Result<()> {
+fn enforce_recent_auth(claims: &IdentityClaims, now: u64) -> Result<()> {
     let authenticated_at = claims.auth_time.unwrap_or(claims.iat);
     if authenticated_at > now.saturating_add(CLOCK_SKEW_SECONDS) {
         bail!("social authentication time is in the future");
@@ -235,20 +239,10 @@ fn enforce_recent_auth(
     if now.saturating_sub(authenticated_at) > MAX_AUTH_AGE_SECONDS {
         bail!("social authentication is too old; sign in again");
     }
-
-    if matches!(provider, SocialProvider::Email) {
-        let sign_in_provider = claims
-            .firebase
-            .as_ref()
-            .and_then(|firebase| firebase.sign_in_provider.as_deref());
-        if !matches!(sign_in_provider, Some("password") | Some("emailLink")) {
-            bail!("Firebase token was not issued by the email provider");
-        }
-    }
     Ok(())
 }
 
-fn unix_time() -> Result<u64> {
+pub fn unix_time() -> Result<u64> {
     Ok(SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("system clock is before Unix epoch")?
@@ -274,9 +268,14 @@ fn validate_provider_policy(policy: &RecoveryPolicy) -> Result<()> {
                 && policy.jwks_uri == "https://appleid.apple.com/auth/keys"
         }
         SocialProvider::Email => {
-            policy.issuer.starts_with("https://securetoken.google.com/")
-                && policy.jwks_uri
-                    == "https://www.googleapis.com/service_accounts/v1/jwk/securetoken@system.gserviceaccount.com"
+            policy.issuer == login::ISSUER
+                && policy.audience == login::AUDIENCE
+                && policy.jwks_uri == login::JWKS_URI
+        }
+        SocialProvider::Github => {
+            policy.issuer == login::GITHUB_ISSUER
+                && policy.audience == login::GITHUB_AUDIENCE
+                && policy.jwks_uri == login::JWKS_URI
         }
     };
     if !allowed {
@@ -295,11 +294,7 @@ fn validate_provider_policy(policy: &RecoveryPolicy) -> Result<()> {
 mod tests {
     use super::*;
 
-    fn claims(
-        issued_at: u64,
-        nonce: Option<&str>,
-        firebase_provider: Option<&str>,
-    ) -> IdentityClaims {
+    fn claims(issued_at: u64, nonce: Option<&str>) -> IdentityClaims {
         IdentityClaims {
             sub: "user-1".into(),
             iss: "issuer".into(),
@@ -309,9 +304,6 @@ mod tests {
             auth_time: None,
             nonce: nonce.map(str::to_owned),
             email_verified: Some(serde_json::Value::Bool(true)),
-            firebase: firebase_provider.map(|provider| FirebaseClaims {
-                sign_in_provider: Some(provider.into()),
-            }),
         }
     }
 
@@ -333,11 +325,11 @@ mod tests {
     #[test]
     fn provider_login_must_be_recent() {
         let now = 2_000_000_000;
-        let recent = claims(now - 60, None, None);
-        assert!(enforce_recent_auth(&recent, &SocialProvider::Google, now).is_ok());
+        let recent = claims(now - 60, None);
+        assert!(enforce_recent_auth(&recent, now).is_ok());
 
-        let stale = claims(now - MAX_AUTH_AGE_SECONDS - 1, None, None);
-        assert!(enforce_recent_auth(&stale, &SocialProvider::Google, now).is_err());
+        let stale = claims(now - MAX_AUTH_AGE_SECONDS - 1, None);
+        assert!(enforce_recent_auth(&stale, now).is_err());
     }
 
     const APP: &str = "0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f";
@@ -369,7 +361,7 @@ mod tests {
 
     fn binding(provider: SocialProvider, nonce: Option<&str>, secret: Option<&str>) -> Result<()> {
         verify_login_binding(
-            &claims(2_000_000_000, nonce, None),
+            &claims(2_000_000_000, nonce),
             &credential(provider.clone(), secret),
             &policy(provider),
         )
@@ -417,17 +409,101 @@ mod tests {
     }
 
     #[test]
-    fn email_tokens_have_no_nonce_to_bind() {
-        assert!(binding(SocialProvider::Email, None, None).is_ok());
+    fn email_tokens_need_the_nonce_and_the_login_secret() {
+        let nonce = bound_nonce(APP, SECRET);
+        assert!(binding(SocialProvider::Email, Some(&nonce), Some(SECRET)).is_ok());
+        assert!(binding(SocialProvider::Email, None, Some(SECRET)).is_err());
+        assert!(binding(SocialProvider::Email, Some(&nonce), None).is_err());
+        assert!(binding(SocialProvider::Email, Some(&bound_nonce(APP, "short")), Some("short"))
+            .is_err());
+    }
+
+    fn email_policy() -> RecoveryPolicy {
+        RecoveryPolicy {
+            app_id: APP.into(),
+            environment_id: "env".into(),
+            provider: SocialProvider::Email,
+            issuer: login::ISSUER.into(),
+            audience: login::AUDIENCE.into(),
+            jwks_uri: login::JWKS_URI.into(),
+        }
     }
 
     #[test]
-    fn email_recovery_accepts_only_firebase_email_authentication() {
-        let now = 2_000_000_000;
-        let email = claims(now - 60, None, Some("password"));
-        assert!(enforce_recent_auth(&email, &SocialProvider::Email, now).is_ok());
+    fn github_policy_must_match_the_enclave_contract() {
+        let mut policy = email_policy();
+        policy.provider = SocialProvider::Github;
+        policy.issuer = login::GITHUB_ISSUER.into();
+        policy.audience = login::GITHUB_AUDIENCE.into();
+        assert!(validate_provider_policy(&policy).is_ok());
 
-        let google = claims(now - 60, None, Some("google.com"));
-        assert!(enforce_recent_auth(&google, &SocialProvider::Email, now).is_err());
+        let mut wrong_issuer = policy.clone();
+        wrong_issuer.issuer = login::ISSUER.into();
+        let mut wrong_audience = policy.clone();
+        wrong_audience.audience = login::AUDIENCE.into();
+        let mut wrong_jwks = policy.clone();
+        wrong_jwks.jwks_uri = "https://example.com/jwks".into();
+        for policy in [wrong_issuer, wrong_audience, wrong_jwks] {
+            assert!(validate_provider_policy(&policy).is_err());
+        }
+    }
+
+    fn email_credential(token: String, secret: Option<&str>) -> ProviderCredential {
+        ProviderCredential {
+            provider: SocialProvider::Email,
+            token_fingerprint: URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())),
+            id_token: token,
+            nonce_preimage: secret.map(str::to_owned),
+        }
+    }
+
+    async fn verify_email(
+        signer: &LoginKey,
+        verifier: &LoginKey,
+        secret: Option<&str>,
+        policy: &RecoveryPolicy,
+    ) -> Result<IdentityClaims> {
+        let token = signer
+            .issue("user@gmail.com", &bound_nonce(APP, SECRET), unix_time()?)
+            .unwrap();
+        let credential = email_credential(token, secret);
+        let challenge = hex_sha256(credential.token_fingerprint.as_bytes());
+        verify_id_token(&reqwest::Client::new(), verifier, &credential, policy, &challenge).await
+    }
+
+    #[tokio::test]
+    async fn a_token_issued_by_the_enclave_verifies_end_to_end() {
+        let key = login::test_key(1);
+        let claims = verify_email(&key, &key, Some(SECRET), &email_policy()).await.unwrap();
+        assert_eq!(claims.sub, login::subject_id("user@gmail.com"));
+    }
+
+    #[tokio::test]
+    async fn an_email_token_fails_with_the_wrong_login_secret() {
+        let key = login::test_key(1);
+        let other = "M25iVXpKU3puUjFaYWg3T1NDTDQtcW1ROUY5YXlwalNoc0hhakxifmZHag";
+        assert!(verify_email(&key, &key, Some(other), &email_policy()).await.is_err());
+        assert!(verify_email(&key, &key, None, &email_policy()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_email_token_signed_by_another_key_fails() {
+        let signer = login::test_key(1);
+        let verifier = login::test_key(2);
+        assert!(verify_email(&signer, &verifier, Some(SECRET), &email_policy()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn an_email_token_fails_under_a_non_contract_policy() {
+        let key = login::test_key(1);
+        let mut wrong_issuer = email_policy();
+        wrong_issuer.issuer = "https://securetoken.google.com/proj".into();
+        let mut wrong_audience = email_policy();
+        wrong_audience.audience = "proj".into();
+        let mut wrong_jwks = email_policy();
+        wrong_jwks.jwks_uri = "https://example.com/jwks".into();
+        for policy in [wrong_issuer, wrong_audience, wrong_jwks] {
+            assert!(verify_email(&key, &key, Some(SECRET), &policy).await.is_err());
+        }
     }
 }

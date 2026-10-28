@@ -2,7 +2,7 @@
 
 Social recovery for Cavos wallets, running in an AWS Nitro Enclave.
 
-A user who has lost every device can sign in with Google (or Apple, or a
+A user who has lost every device can sign in with Google (or Apple, GitHub, or a
 Firebase magic link) and authorise a new device signer. The credential is
 verified — and the authorising signature produced — inside an enclave whose
 exact code is published and measured. Nothing outside that enclave ever sees the
@@ -76,6 +76,20 @@ on spot reasonable.
 starting, how to turn on the relay's diagnostics, what the bill is made of, and
 the mistakes that have already cost us an afternoon. Read it before a first
 deploy, which is a different and longer procedure.
+## Releases
+
+A release is a signed, attested build of the enclave image. To cut one, push a tag `vN` (a positive integer, no leading zeros) on `main`:
+
+```bash
+git tag v3 && git push origin v3
+```
+
+The `Release` workflow builds the image reproducibly, attests it with Sigstore, and publishes a GitHub release containing `enclave.eif`, `measurements.json` and `enclave-<pcr0>.sigstore.json`. The job runs in the `release` environment, so it waits for a required reviewer.
+
+`@cavos/kit` accepts any release published by this workflow. Each release expires 365 days after it is built, so publish a new tag before `expiresAt`.
+
+Publishing a release does not deploy it. To run it, upload that release's `enclave.eif` to S3 and set `enclave_pcr0` (the KMS key policy) to its PCR0, as described in `infra/README.md`; those operator steps are unchanged.
+
 ## History
 
 This service ran on Google Confidential Space until August 2026. That design

@@ -33,6 +33,31 @@ jobs:
         with:
           persist-credentials: false
 
+      - name: Install Docker 29.4.1
+        env:
+          DOCKER_KEY_SHA256: 1500c1f56fa9e26b9b8f42452a553675796ade0807cdce11975eb98170b3a570
+          DOCKER_VERSION: 5:29.4.1-1~ubuntu.24.04~noble
+          BUILDX_VERSION: 0.33.0-1~ubuntu.24.04~noble
+        run: |
+          sudo install -m 0755 -d /etc/apt/keyrings
+          sudo curl -fsSL https://download.docker.com/linux/ubuntu/gpg -o /etc/apt/keyrings/docker.asc
+          echo "$DOCKER_KEY_SHA256  /etc/apt/keyrings/docker.asc" | sha256sum -c -
+          sudo chmod a+r /etc/apt/keyrings/docker.asc
+          sudo tee /etc/apt/sources.list.d/docker.sources >/dev/null <<SOURCES
+          Types: deb
+          URIs: https://download.docker.com/linux/ubuntu
+          Suites: noble
+          Components: stable
+          Architectures: arm64
+          Signed-By: /etc/apt/keyrings/docker.asc
+          SOURCES
+          sudo apt-get update
+          sudo apt-get install -y --allow-downgrades \
+            "docker-ce=$DOCKER_VERSION" "docker-ce-cli=$DOCKER_VERSION" containerd.io \
+            "docker-buildx-plugin=$BUILDX_VERSION"
+          docker version
+          docker buildx version
+
       - name: Enable the containerd image store
         run: |
           echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null

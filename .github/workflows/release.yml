@@ -1,0 +1,103 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+permissions:
+  contents: read
+
+jobs:
+  release:
+    name: Build, attest and publish
+    runs-on: ubuntu-24.04-arm
+    environment: release
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+      attestations: write
+
+    steps:
+      - name: Validate the tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          if [[ ! $TAG =~ ^v[1-9][0-9]*$ ]]; then
+            echo "Tag '$TAG' must be v<N> with N a positive integer without leading zeros." >&2
+            exit 1
+          fi
+          echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
+
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
+        with:
+          persist-credentials: false
+
+      - name: Enable the containerd image store
+        run: |
+          echo '{"features":{"containerd-snapshotter":true}}' | sudo tee /etc/docker/daemon.json >/dev/null
+          sudo systemctl restart docker
+          status=$(docker info -f '{{ .DriverStatus }}')
+          echo "$status"
+          if [[ $status != *containerd.snapshotter* ]]; then
+            echo "The containerd image store is not active." >&2
+            exit 1
+          fi
+
+      - name: Build the enclave image
+        working-directory: enclave
+        env:
+          MEASUREMENTS_OUT: ${{ github.workspace }}/enclave/build/measurements.json
+          OUTPUT_DIR: ./build
+        run: |
+          mkdir -p build
+          ./scripts/build-enclave.sh
+
+      - name: Write the predicate
+        working-directory: enclave/build
+        run: |
+          expires=$(date -u -d '+365 days' +%Y-%m-%dT%H:%M:%SZ)
+          jq -c --argjson version "$VERSION" --arg expires "$expires" '{
+            pcr0: (.Measurements.PCR0 | ascii_downcase),
+            pcr1: (.Measurements.PCR1 | ascii_downcase),
+            pcr2: (.Measurements.PCR2 | ascii_downcase),
+            version: $version,
+            expiresAt: $expires
+          }' measurements.json > predicate.json
+          cat predicate.json
+          echo "PCR0=$(jq -r .pcr0 predicate.json)" >> "$GITHUB_ENV"
+          echo "EXPIRES=$expires" >> "$GITHUB_ENV"
+
+      - name: Attest the enclave image
+        id: attest
+        uses: actions/attest@1e69f48acb82d1966a394da916b4c1698aa569d6
+        with:
+          subject-path: enclave/build/enclave.eif
+          predicate-type: https://cavos.xyz/attestation/enclave-release/v1
+          predicate-path: enclave/build/predicate.json
+
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ github.ref_name }}
+          BUNDLE: ${{ steps.attest.outputs.bundle-path }}
+        run: |
+          cp "$BUNDLE" "enclave-${PCR0}.sigstore.json"
+          pcr1=$(jq -r .pcr1 enclave/build/predicate.json)
+          pcr2=$(jq -r .pcr2 enclave/build/predicate.json)
+          cat > notes.md <<NOTES
+          Enclave release ${TAG}.
+
+          - Version: ${VERSION}
+          - Expires: ${EXPIRES}
+          - PCR0: \`${PCR0}\`
+          - PCR1: \`${pcr1}\`
+          - PCR2: \`${pcr2}\`
+          NOTES
+          gh release create "$TAG" \
+            --title "$TAG" \
+            --notes-file notes.md \
+            --verify-tag \
+            enclave/build/enclave.eif \
+            "enclave-${PCR0}.sigstore.json" \
+            enclave/build/measurements.json

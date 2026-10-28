@@ -60,6 +60,10 @@ pub enum Failure {
     CodeCooldown,
     /// The code is wrong, expired, used up, or was never requested.
     CodeRejected,
+    /// GitHub did not accept the code or verifier, or returned no user.
+    GithubRejected,
+    /// github.com or api.github.com could not be reached.
+    GithubUnreachable,
 }
 
 impl Failure {
@@ -80,6 +84,8 @@ impl Failure {
             Failure::EmailUndeliverable => "email_undeliverable",
             Failure::CodeCooldown => "code_cooldown",
             Failure::CodeRejected => "code_rejected",
+            Failure::GithubRejected => "github_rejected",
+            Failure::GithubUnreachable => "github_unreachable",
         }
     }
 }
@@ -142,6 +148,8 @@ mod tests {
             Failure::EmailUndeliverable,
             Failure::CodeCooldown,
             Failure::CodeRejected,
+            Failure::GithubRejected,
+            Failure::GithubUnreachable,
         ];
         let mut codes: Vec<_> = all.iter().map(|f| f.code()).collect();
         codes.sort_unstable();

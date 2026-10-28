@@ -17,12 +17,17 @@ use p256::{
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
+use crate::github::GithubUser;
+
 pub const ISSUER: &str = "https://enclave.cavos.xyz";
 pub const AUDIENCE: &str = "cavos-email";
 pub const JWKS_URI: &str = "https://enclave.cavos.xyz/.well-known/jwks.json";
+pub const GITHUB_ISSUER: &str = "https://enclave.cavos.xyz/github";
+pub const GITHUB_AUDIENCE: &str = "cavos-github";
 pub const TOKEN_LIFETIME_SECONDS: u64 = 3600;
 
 const SUBJECT_DOMAIN: &str = "cavos-email-subject-v1:";
+const GITHUB_SUBJECT_DOMAIN: &str = "cavos-github-subject-v1:";
 
 /// Trim and ASCII-lowercase, the one form of an address used everywhere.
 pub fn normalize_email(email: &str) -> String {
@@ -33,6 +38,15 @@ pub fn normalize_email(email: &str) -> String {
 /// domain-separated normalised address.
 pub fn subject_id(normalized_email: &str) -> String {
     hex::encode(Sha256::digest(format!("{SUBJECT_DOMAIN}{normalized_email}").as_bytes()))
+}
+
+/// The stable subject of a GitHub identity: lowercase hex SHA-256 over the
+/// domain-separated OAuth client id and GitHub user id. It differs per OAuth app
+/// on purpose, since GitHub reports the same user id to every app.
+pub fn github_subject_id(client_id: &str, user_id: u64) -> String {
+    hex::encode(Sha256::digest(
+        format!("{GITHUB_SUBJECT_DOMAIN}{client_id}:{user_id}").as_bytes(),
+    ))
 }
 
 pub struct LoginKey {
@@ -75,8 +89,7 @@ impl LoginKey {
 
     /// Sign a login token for `email` (already normalised), bound to `nonce`.
     pub fn issue(&self, email: &str, nonce: &str, now: u64) -> Result<String> {
-        let header = json!({ "alg": "ES256", "typ": "JWT", "kid": self.kid });
-        let claims = json!({
+        self.sign(&json!({
             "iss": ISSUER,
             "aud": AUDIENCE,
             "sub": subject_id(email),
@@ -86,11 +99,38 @@ impl LoginKey {
             "iat": now,
             "auth_time": now,
             "exp": now + TOKEN_LIFETIME_SECONDS,
-        });
+        }))
+    }
+
+    /// Sign a login token for a GitHub `user`, bound to `nonce` and to the OAuth
+    /// app (`client_id`) the code was redeemed with.
+    pub fn issue_github(
+        &self,
+        user: &GithubUser,
+        client_id: &str,
+        nonce: &str,
+        now: u64,
+    ) -> Result<String> {
+        self.sign(&json!({
+            "iss": GITHUB_ISSUER,
+            "aud": GITHUB_AUDIENCE,
+            "sub": github_subject_id(client_id, user.id),
+            "azp": client_id,
+            "name": user.name.as_deref().unwrap_or(&user.login),
+            "preferred_username": user.login,
+            "nonce": nonce,
+            "iat": now,
+            "auth_time": now,
+            "exp": now + TOKEN_LIFETIME_SECONDS,
+        }))
+    }
+
+    fn sign(&self, claims: &serde_json::Value) -> Result<String> {
+        let header = json!({ "alg": "ES256", "typ": "JWT", "kid": self.kid });
         let signing_input = format!(
             "{}.{}",
             URL_SAFE_NO_PAD.encode(serde_json::to_vec(&header)?),
-            URL_SAFE_NO_PAD.encode(serde_json::to_vec(&claims)?),
+            URL_SAFE_NO_PAD.encode(serde_json::to_vec(claims)?),
         );
         let signature: Signature = self.signing.sign(signing_input.as_bytes());
         Ok(format!("{signing_input}.{}", URL_SAFE_NO_PAD.encode(signature.to_bytes())))
@@ -151,6 +191,58 @@ mod tests {
             })
         );
         assert_eq!(URL_SAFE_NO_PAD.decode(parts[2]).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn github_subject_is_domain_separated_and_differs_per_app() {
+        let expected = hex::encode(Sha256::digest(b"cavos-github-subject-v1:Iv1.abc:583231"));
+        assert_eq!(github_subject_id("Iv1.abc", 583231), expected);
+        assert_eq!(expected.len(), 64);
+        assert_ne!(github_subject_id("Iv1.abc", 583231), github_subject_id("Iv1.xyz", 583231));
+        assert_ne!(github_subject_id("Iv1.abc", 583231), github_subject_id("Iv1.abc", 583232));
+    }
+
+    #[test]
+    fn github_token_has_the_contract_shape() {
+        let key = test_key(7);
+        let user = GithubUser { id: 583231, login: "octocat".into(), name: None };
+        let token = key.issue_github(&user, "Iv1.abc", "app.nonce", 1_790_000_000).unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+        assert_eq!(parts.len(), 3);
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header, json!({ "alg": "ES256", "typ": "JWT", "kid": key.kid() }));
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(
+            claims,
+            json!({
+                "iss": "https://enclave.cavos.xyz/github",
+                "aud": "cavos-github",
+                "sub": github_subject_id("Iv1.abc", 583231),
+                "azp": "Iv1.abc",
+                "name": "octocat",
+                "preferred_username": "octocat",
+                "nonce": "app.nonce",
+                "iat": 1_790_000_000u64,
+                "auth_time": 1_790_000_000u64,
+                "exp": 1_790_003_600u64,
+            })
+        );
+        assert_eq!(URL_SAFE_NO_PAD.decode(parts[2]).unwrap().len(), 64);
+    }
+
+    #[test]
+    fn github_token_prefers_the_display_name() {
+        let key = test_key(7);
+        let user = GithubUser { id: 1, login: "octocat".into(), name: Some("The Octocat".into()) };
+        let token = key.issue_github(&user, "Iv1.abc", "n", 1).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(claims["name"], "The Octocat");
+        assert_eq!(claims["preferred_username"], "octocat");
     }
 
     #[test]

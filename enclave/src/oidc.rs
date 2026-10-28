@@ -73,7 +73,7 @@ pub async fn verify_id_token(
         .context("OIDC token omitted kid")
         .context(Failure::SignatureRejected)?;
     let (algorithm, decoding_key) = match policy.provider {
-        SocialProvider::Email => {
+        SocialProvider::Email | SocialProvider::Github => {
             if kid != login.kid() {
                 return Err(anyhow!("login token names an unknown key")
                     .context(Failure::SignatureRejected));
@@ -272,6 +272,11 @@ fn validate_provider_policy(policy: &RecoveryPolicy) -> Result<()> {
                 && policy.audience == login::AUDIENCE
                 && policy.jwks_uri == login::JWKS_URI
         }
+        SocialProvider::Github => {
+            policy.issuer == login::GITHUB_ISSUER
+                && policy.audience == login::GITHUB_AUDIENCE
+                && policy.jwks_uri == login::JWKS_URI
+        }
     };
     if !allowed {
         bail!("provider issuer/JWKS combination is not allowlisted");
@@ -421,6 +426,25 @@ mod tests {
             issuer: login::ISSUER.into(),
             audience: login::AUDIENCE.into(),
             jwks_uri: login::JWKS_URI.into(),
+        }
+    }
+
+    #[test]
+    fn github_policy_must_match_the_enclave_contract() {
+        let mut policy = email_policy();
+        policy.provider = SocialProvider::Github;
+        policy.issuer = login::GITHUB_ISSUER.into();
+        policy.audience = login::GITHUB_AUDIENCE.into();
+        assert!(validate_provider_policy(&policy).is_ok());
+
+        let mut wrong_issuer = policy.clone();
+        wrong_issuer.issuer = login::ISSUER.into();
+        let mut wrong_audience = policy.clone();
+        wrong_audience.audience = login::AUDIENCE.into();
+        let mut wrong_jwks = policy.clone();
+        wrong_jwks.jwks_uri = "https://example.com/jwks".into();
+        for policy in [wrong_issuer, wrong_audience, wrong_jwks] {
+            assert!(validate_provider_policy(&policy).is_err());
         }
     }
 

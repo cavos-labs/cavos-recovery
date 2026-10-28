@@ -6,6 +6,7 @@ pub enum SocialProvider {
     Google,
     Apple,
     Email,
+    Github,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -66,6 +67,11 @@ pub enum WorkloadJob {
     VerifyEmail {
         email: String,
         code: String,
+        client_nonce: String,
+    },
+    /// Trade a GitHub authorization code for a token signed by the enclave.
+    VerifyGithub {
+        code_verifier: String,
         client_nonce: String,
     },
 }
@@ -129,6 +135,33 @@ pub enum WorkloadResult {
     EmailVerified {
         id_token: String,
     },
+    GithubVerified {
+        id_token: String,
+    },
+}
+
+/// What the control plane supplies to redeem a GitHub authorization code. It
+/// is untrusted input: the client's `code_verifier`, which arrives inside the
+/// encrypted job, is what stops anyone but the client redeeming the code.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct GithubGrant {
+    pub code: String,
+    pub app_id: String,
+    pub client_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for GithubGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GithubGrant")
+            .field("code", &"<redacted>")
+            .field("app_id", &self.app_id)
+            .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -221,6 +254,10 @@ pub enum EnclaveRequest {
         /// Not used by `verify_email`, which has no credential yet.
         #[serde(default)]
         auth_challenge_hash: String,
+        /// Supplied by the control plane, which bound the code to the app. Only
+        /// `verify_github` uses it.
+        #[serde(default)]
+        github: Option<GithubGrant>,
     },
     /// Generate a one-time code and mail it to `email`.
     SendCode {

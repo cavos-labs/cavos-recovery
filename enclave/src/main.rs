@@ -27,6 +27,7 @@
 mod codes;
 mod crypto;
 mod failure;
+mod github;
 mod kms;
 mod login;
 mod mail;
@@ -42,8 +43,8 @@ use std::time::{Duration, Instant};
 use anyhow::{anyhow, bail, Context, Result};
 use p256::{ecdsa::SigningKey, SecretKey};
 use protocol::{
-    EnclaveConfig, EnclaveRequest, EnclaveResponse, EncryptedJob, MailConfig, ProviderCredential,
-    SealedRecoveryRecord, SealedResult, WorkloadJob, WorkloadResult,
+    EnclaveConfig, EnclaveRequest, EnclaveResponse, EncryptedJob, GithubGrant, MailConfig,
+    ProviderCredential, SealedRecoveryRecord, SealedResult, WorkloadJob, WorkloadResult,
 };
 use reqwest::Client;
 use subtle::ConstantTimeEq;
@@ -222,6 +223,8 @@ fn build_http_client() -> Result<Client> {
         .resolve("www.googleapis.com", oidc)
         .resolve("appleid.apple.com", oidc)
         .resolve("securetoken.google.com", oidc)
+        .resolve("github.com", oidc)
+        .resolve("api.github.com", oidc)
         // Regional KMS endpoints all resolve through the same proxy; the exact
         // host is set by the configured region at call time.
         .resolve("kms.us-east-1.amazonaws.com", local(KMS_HOST.local_port))
@@ -324,7 +327,7 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
             })
         }
 
-        EnclaveRequest::RunJob { session_id, job, auth_challenge_hash } => {
+        EnclaveRequest::RunJob { session_id, job, auth_challenge_hash, github } => {
             validate_session_id(&session_id)?;
             // Claiming removes the session, so this job cannot be replayed.
             let channel = {
@@ -337,12 +340,15 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
             let (plaintext, response_key) = decrypt_job(&channel, &session_id, job)?;
             let job: WorkloadJob =
                 serde_json::from_slice(&plaintext).context("invalid recovery job")?;
-            let result = process_job(enclave, job, &auth_challenge_hash).await?;
+            let result = process_job(enclave, job, &auth_challenge_hash, github.as_ref()).await?;
             let (nonce, ciphertext) =
                 response_key.seal(&serde_json::to_vec(&result)?, &session_id)?;
             let result = match result {
                 WorkloadResult::EmailVerified { .. } => {
                     WorkloadResult::EmailVerified { id_token: String::new() }
+                }
+                WorkloadResult::GithubVerified { .. } => {
+                    WorkloadResult::GithubVerified { id_token: String::new() }
                 }
                 other => other,
             };
@@ -389,6 +395,7 @@ async fn process_job(
     enclave: &Enclave,
     job: WorkloadJob,
     auth_challenge_hash: &str,
+    github: Option<&GithubGrant>,
 ) -> Result<WorkloadResult> {
     match job {
         WorkloadJob::Enroll { credential, policy, stellar_dek_b64 } => {
@@ -511,6 +518,21 @@ async fn process_job(
             )?;
             Ok(WorkloadResult::EmailVerified { id_token })
         }
+
+        WorkloadJob::VerifyGithub { code_verifier, client_nonce } => {
+            let grant = github.ok_or_else(|| anyhow!("github grant is missing"))?;
+            validate_client_nonce(&client_nonce)?;
+            validate_app_id(&grant.app_id)?;
+            validate_code_verifier(&code_verifier)?;
+            let user = github::user_for_code(&enclave.http, grant, &code_verifier).await?;
+            let id_token = enclave.login.issue_github(
+                &user,
+                &grant.client_id,
+                &format!("{}.{client_nonce}", grant.app_id),
+                oidc::unix_time()?,
+            )?;
+            Ok(WorkloadResult::GithubVerified { id_token })
+        }
     }
 }
 
@@ -592,6 +614,31 @@ fn validate_client_nonce(nonce: &str) -> Result<()> {
     Ok(())
 }
 
+/// The app id is bound into the token's nonce, so it must be a canonical UUID.
+fn validate_app_id(app_id: &str) -> Result<()> {
+    let canonical = app_id.len() == 36
+        && app_id.bytes().enumerate().all(|(index, byte)| match index {
+            8 | 13 | 18 | 23 => byte == b'-',
+            _ => byte.is_ascii_hexdigit(),
+        });
+    if !canonical {
+        bail!("app id is not a canonical UUID");
+    }
+    Ok(())
+}
+
+/// A PKCE verifier is 43 to 128 unreserved characters (RFC 7636 section 4.1).
+fn validate_code_verifier(verifier: &str) -> Result<()> {
+    if !(43..=128).contains(&verifier.len())
+        || !verifier
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'.' | b'_' | b'~'))
+    {
+        bail!("code verifier is malformed");
+    }
+    Ok(())
+}
+
 /// Unseal a record and prove the credential is the identity it was sealed for.
 ///
 /// Everything a job may do with a record — sign with its key, release its DEK,
@@ -631,7 +678,10 @@ async fn open_record(
 
 #[cfg(test)]
 mod tests {
-    use super::{validate_client_nonce, validate_send_code, validate_session_id};
+    use super::{
+        validate_app_id, validate_client_nonce, validate_code_verifier, validate_send_code,
+        validate_session_id,
+    };
 
     #[test]
     fn accepts_uuid_shaped_session_ids() {
@@ -669,6 +719,31 @@ mod tests {
         assert!(validate_send_code("a@gmail.com", "app", &"a".repeat(41)).is_err());
         assert!(validate_send_code("a@gmail.com", "app", "Acme\nBcc: x").is_err());
         assert!(validate_send_code("a@gmail.com", "app", "<b>Acme</b>").is_err());
+    }
+
+    #[test]
+    fn app_id_must_be_a_canonical_uuid() {
+        assert!(validate_app_id("0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f").is_ok());
+        assert!(validate_app_id("0F9D5A1C-3B2E-4C5A-8D7F-1A2B3C4D5E6F").is_ok());
+        assert!(validate_app_id("").is_err());
+        assert!(validate_app_id("0f9d5a1c3b2e4c5a8d7f1a2b3c4d5e6f").is_err());
+        assert!(validate_app_id("0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6").is_err());
+        assert!(validate_app_id("0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6g").is_err());
+        assert!(validate_app_id("0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f.").is_err());
+        assert!(validate_app_id("0f9d5a1c_3b2e-4c5a-8d7f-1a2b3c4d5e6f").is_err());
+    }
+
+    #[test]
+    fn code_verifier_follows_rfc_7636() {
+        assert!(validate_code_verifier(&"a".repeat(43)).is_ok());
+        assert!(validate_code_verifier(&"a".repeat(128)).is_ok());
+        assert!(validate_code_verifier("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk").is_ok());
+        assert!(validate_code_verifier(&format!("{}-._~", "a".repeat(40))).is_ok());
+        assert!(validate_code_verifier(&"a".repeat(42)).is_err());
+        assert!(validate_code_verifier(&"a".repeat(129)).is_err());
+        assert!(validate_code_verifier(&format!("{}=", "a".repeat(43))).is_err());
+        assert!(validate_code_verifier(&format!("{} ", "a".repeat(43))).is_err());
+        assert!(validate_code_verifier(&format!("{}&x=1", "a".repeat(43))).is_err());
     }
 
     #[test]

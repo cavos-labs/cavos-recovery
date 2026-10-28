@@ -46,10 +46,12 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 
 /// Hosts the enclave is allowed to reach through here.
 ///
-/// The first four are provider JWKS or discovery hosts. `dns.google` is the
-/// DNS-over-HTTPS resolver the enclave asks for a recipient domain's MX records
-/// when it mails a login code. Separately, any host starting with `mta-sts.` is
-/// allowed, because the enclave fetches the recipient domain's MTA-STS policy
+/// The first four are provider JWKS or discovery hosts, and `github.com` and
+/// `api.github.com` are where the enclave redeems a GitHub authorization code.
+/// `dns.google` is the DNS-over-HTTPS resolver the enclave asks for a recipient
+/// domain's MX records when it mails a login code. Separately, any host
+/// starting with `mta-sts.` is allowed, because the enclave fetches the
+/// recipient domain's MTA-STS policy
 /// from `https://mta-sts.<domain>/.well-known/mta-sts.txt` and the domain is
 /// whatever address a user types. Adding a provider means adding it here — and,
 /// unlike the port-per-provider alternative, nothing in the measured image
@@ -59,6 +61,8 @@ const ALLOWED_HOSTS: &[&str] = &[
     "www.googleapis.com",
     "appleid.apple.com",
     "securetoken.google.com",
+    "github.com",
+    "api.github.com",
     "dns.google",
 ];
 
@@ -319,6 +323,8 @@ mod tests {
         assert!(!is_allowed("evilmta-sts.example.org"));
         assert!(!is_allowed("mta-sts"));
         assert!(!is_allowed("dns.google.evil.com"));
+        assert!(!is_allowed("github.com.evil.com"));
+        assert!(!is_allowed("gist.github.com"));
         assert!(!is_allowed("169.254.169.254"));
     }
 

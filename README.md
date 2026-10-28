@@ -2,7 +2,7 @@
 
 Social recovery for Cavos wallets, running in an AWS Nitro Enclave.
 
-A user who has lost every device can sign in with Google (or Apple, or a
+A user who has lost every device can sign in with Google (or Apple, GitHub, or a
 Firebase magic link) and authorise a new device signer. The credential is
 verified — and the authorising signature produced — inside an enclave whose
 exact code is published and measured. Nothing outside that enclave ever sees the

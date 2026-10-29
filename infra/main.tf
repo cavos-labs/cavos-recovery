@@ -28,7 +28,7 @@ data "aws_ec2_instance_type_offerings" "by_az" {
 }
 
 locals {
-  supported_azs = setintersection([
+  supported_azs = setintersection(toset(var.availability_zones), [
     for offering in data.aws_ec2_instance_type_offerings.by_az : toset(offering.locations)
   ]...)
 }
@@ -482,7 +482,7 @@ resource "aws_autoscaling_group" "enclave_host" {
       # 100% spot. At capacity 1 any on-demand base would mean paying the
       # on-demand price for the only instance, which is the whole point of this
       # change. Durability comes from breadth instead: five instance types
-      # across every default subnet is roughly twenty-five capacity pools, and
+      # across three zones is fifteen capacity pools, and
       # `price-capacity-optimized` picks the one least likely to be reclaimed.
       on_demand_base_capacity                  = 0
       on_demand_percentage_above_base_capacity = 0
@@ -497,9 +497,8 @@ resource "aws_autoscaling_group" "enclave_host" {
 
       # Every type here is arm64, has at least 2 vCPUs, and supports Nitro
       # Enclaves — verified with `describe-instance-types`. The allocator asks
-      # for 1 vCPU and 1 GiB regardless, so the larger m-family members simply
-      # leave more for the parent. Burstable types are absent because no t3 or
-      # t4g instance supports enclaves at all.
+      # for 1 vCPU and 1 GiB regardless. Burstable types are absent because no
+      # t3 or t4g instance supports enclaves at all.
       dynamic "override" {
         for_each = var.instance_types
         content {

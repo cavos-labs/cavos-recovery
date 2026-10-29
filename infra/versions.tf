@@ -21,3 +21,15 @@ provider "aws" {
     }
   }
 }
+
+provider "aws" {
+  alias  = "us_east_2"
+  region = "us-east-2"
+
+  default_tags {
+    tags = {
+      Project   = "cavos-confidential-recovery"
+      ManagedBy = "terraform"
+    }
+  }
+}

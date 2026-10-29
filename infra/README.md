@@ -5,14 +5,14 @@ wraps its root sealing key.
 
 ## Turning it on and off
 
-**The host is currently off.** `host_count` defaults to `0`, and that is a real
+**The host is on or off per region.** `host_count_us_east_1` and `host_count_us_east_2` each take `0` or `1`, and zero is a real
 operating state rather than a broken one — see the trade-offs below.
 
 ### On
 
 ```bash
 eval "$(aws configure export-credentials --format env)"   # see Credentials
-terraform apply -var host_count=1
+terraform apply -var host_count_us_east_1=1
 ```
 
 That is all. The enclave keeps no durable state: the wrapped root key is in
@@ -47,7 +47,7 @@ Compare that against `enclave_pcr0` in `variables.tf` **and** the list in
 ### Off
 
 ```bash
-terraform apply          # host_count defaults to 0
+terraform apply -var host_count_us_east_1=0 -var host_count_us_east_2=0
 ```
 
 While it is off there is no enrolment and no recovery. Wallets keep signing:
@@ -70,7 +70,7 @@ undone.
 
 ### Things that have bitten us
 
-- **`-var host_count=1` is not sticky.** It applies to that command only, so a
+- **`-var host_count_us_east_1=1` is not sticky.** It applies to that command only, so a
   later bare `terraform apply` turns the host back off. To leave it running,
   change the default in `variables.tf` and commit it.
 - **The relay binary is built for the host, not for your laptop.** Build it

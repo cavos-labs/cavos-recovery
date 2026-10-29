@@ -129,25 +129,76 @@ variable "ssh_ingress_cidrs" {
   default     = []
 }
 
-variable "host_count" {
+variable "host_count_us_east_1" {
   description = <<-EOT
-    How many enclave hosts to run. One, or zero to turn the service off.
+    How many enclave hosts to run in us-east-1. One, or zero to turn the host
+    off. During the move to us-east-2 both regions may be 1 at once; this goes
+    to 0 after the DNS cutover.
 
     Zero is a real operating state, not a broken one: the enclave holds no
     durable state. The wrapped root key lives in Parameter Store, the image and
     the relay binary in S3, and the KMS key policy is untouched — so coming back
     is this variable and an apply, with nothing to restore.
 
-    While it is zero, social recovery does not work: no enrolment, no recovery.
-    Wallets keep signing, because that is the device signer against the contract
-    on-chain and has never involved this host. No funds are at risk either way.
+    While both host counts are zero, social recovery does not work: no
+    enrolment, no recovery. Wallets keep signing, because that is the device
+    signer against the contract on-chain and has never involved this host. No
+    funds are at risk either way.
+  EOT
+  type        = number
+  default     = 1
+
+  validation {
+    condition     = var.host_count_us_east_1 >= 0 && var.host_count_us_east_1 <= 1
+    error_message = "The enclave host is a singleton: 0 or 1."
+  }
+}
+
+variable "host_count_us_east_2" {
+  description = <<-EOT
+    How many enclave hosts to run in us-east-2. One, or zero for none. The KMS
+    key, Parameter Store and the artifacts bucket stay in us-east-1; this host
+    reaches them across regions. During the migration both regions may be 1 at
+    once, and var.host_count_us_east_1 goes to 0 after the DNS cutover.
   EOT
   type        = number
   default     = 0
 
   validation {
-    condition     = var.host_count >= 0 && var.host_count <= 1
+    condition     = var.host_count_us_east_2 >= 0 && var.host_count_us_east_2 <= 1
     error_message = "The enclave host is a singleton: 0 or 1."
+  }
+}
+
+variable "instance_types_us_east_2" {
+  description = <<-EOT
+    Graviton instances the us-east-2 spot fleet may draw from, in order of
+    preference. 90-day spot averages to October 2026 in us-east-2 were
+    $0.013-0.0175/h for c8gn/c7gd/c6gd in their best zones versus ~$0.025/h in
+    us-east-1. With these four types every us-east-2 zone scores 9/10 on
+    get-spot-placement-scores, while c8gn+c7gd alone score 3.
+  EOT
+  type        = list(string)
+  default     = ["c8gn.large", "c7gd.large", "c6gd.large", "c8g.large"]
+
+  validation {
+    condition     = length(var.instance_types_us_east_2) > 0
+    error_message = "At least one instance type is required."
+  }
+}
+
+variable "availability_zones_us_east_2" {
+  description = <<-EOT
+    Zones the us-east-2 host may launch in, intersected with the zones that
+    offer every type in var.instance_types_us_east_2. With the default types
+    every zone scores 9/10 on get-spot-placement-scores; c8gn+c7gd alone score 3.
+  EOT
+  type        = list(string)
+  default     = ["us-east-2a", "us-east-2b", "us-east-2c"]
+
+  validation {
+    condition     = length(var.availability_zones_us_east_2) > 0
+    error_message = "At least one availability zone is required."
   }
 }
 

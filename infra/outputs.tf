@@ -4,7 +4,12 @@ output "elastic_ip" {
     DNS is hosted. Caddy cannot obtain a certificate until that record resolves,
     so the relay stays unreachable over HTTPS until this step is done.
   EOT
-  value       = aws_eip.instance.public_ip
+  value       = module.host_us_east_1.elastic_ip
+}
+
+output "elastic_ip_us_east_2" {
+  description = "Address of the us-east-2 host. Point `var.hostname` here at the DNS cutover."
+  value       = module.host_us_east_2.elastic_ip
 }
 
 output "relay_url" {
@@ -38,5 +43,10 @@ output "autoscaling_group" {
 
     then `aws ssm start-session --target <that>`.
   EOT
-  value       = aws_autoscaling_group.enclave_host.name
+  value       = module.host_us_east_1.autoscaling_group
+}
+
+output "autoscaling_group_us_east_2" {
+  description = "The us-east-2 host's autoscaling group; same lookup as above with `--region us-east-2`."
+  value       = module.host_us_east_2.autoscaling_group
 }

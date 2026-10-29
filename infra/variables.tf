@@ -13,23 +13,47 @@ variable "instance_types" {
     c6g.large (2 vCPU / 4 GB) gives the enclave 1 vCPU and the parent 1.
     Graviton has no SMT so that split is real, not shared. It is enough for this
     workload — roughly two seconds of P-256 and AES per request — but it has no
-    headroom. The m-family entries are the same 2 vCPUs with more memory, which
-    the allocator ignores; they are here for capacity breadth, not performance.
+    headroom.
 
     The list is what makes running 100% spot reasonable. One instance type in
     one subnet is a single capacity pool and a single point of reclamation; five
-    types across the default subnets is roughly twenty-five, and the allocation
-    strategy picks the deepest. Every entry must support Nitro Enclaves — check
-    with `aws ec2 describe-instance-types --filters
+    types across three zones is fifteen, and the allocation strategy picks the
+    deepest. Every entry must support Nitro Enclaves — check with
+    `aws ec2 describe-instance-types --filters
     Name=nitro-enclaves-support,Values=supported` before adding one. No
     burstable (t3/t4g) instance qualifies.
+
+    The set is chosen on price as much as breadth, because the autoscaling
+    group picks a pool only at launch and stays in it however far its price
+    drifts. m6g and m7g were dropped in October 2026: over the previous 90 days
+    they averaged $0.030-0.050/h against $0.024-0.030/h for the c-family in the
+    zones below, and the host had settled in a c8g pool that drifted from
+    $0.030 to $0.040/h. Re-check `get-spot-placement-scores` before trimming:
+    c6g, c6gd and c7g alone score 1 of 10 in us-east-1c/d/f, and only adding
+    c8g and c6gn brings every zone to 9.
   EOT
   type        = list(string)
-  default     = ["c6g.large", "c7g.large", "m6g.large", "m7g.large", "c8g.large"]
+  default     = ["c6g.large", "c6gd.large", "c7g.large", "c8g.large", "c6gn.large"]
 
   validation {
     condition     = length(var.instance_types) > 0
     error_message = "At least one instance type is required."
+  }
+}
+
+variable "availability_zones" {
+  description = <<-EOT
+    Zones the host may launch in, intersected with the zones that offer every
+    type in var.instance_types. us-east-1a and 1b are left out on price: every
+    type above averaged more there over the 90 days to October 2026 (c6g $0.030
+    and $0.031/h in 1a and 1b against $0.024-0.026/h in 1c, 1d and 1f).
+  EOT
+  type        = list(string)
+  default     = ["us-east-1c", "us-east-1d", "us-east-1f"]
+
+  validation {
+    condition     = length(var.availability_zones) > 0
+    error_message = "At least one availability zone is required."
   }
 }
 

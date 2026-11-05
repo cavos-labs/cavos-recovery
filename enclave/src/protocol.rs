@@ -7,6 +7,7 @@ pub enum SocialProvider {
     Apple,
     Email,
     Github,
+    Telegram,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -74,6 +75,16 @@ pub enum WorkloadJob {
         code_verifier: String,
         client_nonce: String,
     },
+    /// Trade a Telegram authorization code for a token signed by the enclave.
+    ///
+    /// Unlike `verify_github`, the job carries the login secret itself rather
+    /// than its hash. The hash is public (it is the `nonce` in the authorize
+    /// URL), so a job that only had to name it could be built by anyone who
+    /// saw the code. The secret is something only the client holds.
+    VerifyTelegram {
+        code_verifier: String,
+        login_secret: String,
+    },
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -138,6 +149,9 @@ pub enum WorkloadResult {
     GithubVerified {
         id_token: String,
     },
+    TelegramVerified {
+        id_token: String,
+    },
 }
 
 /// What the control plane supplies to redeem a GitHub authorization code. It
@@ -158,6 +172,31 @@ impl std::fmt::Debug for GithubGrant {
             .field("code", &"<redacted>")
             .field("app_id", &self.app_id)
             .field("client_id", &self.client_id)
+            .field("client_secret", &"<redacted>")
+            .field("redirect_uri", &self.redirect_uri)
+            .finish()
+    }
+}
+
+/// What the control plane supplies to redeem a Telegram authorization code.
+/// Untrusted input, like [`GithubGrant`]: the bot it names only decides which
+/// identity a code can produce, and the login secret in the encrypted job is
+/// what ties the code to the client.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct TelegramGrant {
+    pub code: String,
+    pub app_id: String,
+    pub bot_id: String,
+    pub client_secret: String,
+    pub redirect_uri: String,
+}
+
+impl std::fmt::Debug for TelegramGrant {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("TelegramGrant")
+            .field("code", &"<redacted>")
+            .field("app_id", &self.app_id)
+            .field("bot_id", &self.bot_id)
             .field("client_secret", &"<redacted>")
             .field("redirect_uri", &self.redirect_uri)
             .finish()
@@ -258,6 +297,9 @@ pub enum EnclaveRequest {
         /// `verify_github` uses it.
         #[serde(default)]
         github: Option<GithubGrant>,
+        /// Supplied by the control plane for `verify_telegram` only.
+        #[serde(default)]
+        telegram: Option<Box<TelegramGrant>>,
     },
     /// Generate a one-time code and mail it to `email`.
     SendCode {

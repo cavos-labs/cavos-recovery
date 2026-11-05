@@ -64,6 +64,11 @@ pub enum Failure {
     GithubRejected,
     /// github.com or api.github.com could not be reached.
     GithubUnreachable,
+    /// Telegram did not accept the code, or its id_token failed a check:
+    /// signature, issuer, bot, expiry, nonce, or a missing user id.
+    TelegramRejected,
+    /// oauth.telegram.org could not be reached or answered unreadably.
+    TelegramUnreachable,
 }
 
 impl Failure {
@@ -86,6 +91,8 @@ impl Failure {
             Failure::CodeRejected => "code_rejected",
             Failure::GithubRejected => "github_rejected",
             Failure::GithubUnreachable => "github_unreachable",
+            Failure::TelegramRejected => "telegram_rejected",
+            Failure::TelegramUnreachable => "telegram_unreachable",
         }
     }
 }
@@ -150,6 +157,8 @@ mod tests {
             Failure::CodeRejected,
             Failure::GithubRejected,
             Failure::GithubUnreachable,
+            Failure::TelegramRejected,
+            Failure::TelegramUnreachable,
         ];
         let mut codes: Vec<_> = all.iter().map(|f| f.code()).collect();
         codes.sort_unstable();

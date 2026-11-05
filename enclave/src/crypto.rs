@@ -68,6 +68,7 @@ pub fn policy_hash(policy: &RecoveryPolicy) -> [u8; 32] {
         SocialProvider::Apple => b"apple".as_slice(),
         SocialProvider::Email => b"email".as_slice(),
         SocialProvider::Github => b"github".as_slice(),
+        SocialProvider::Telegram => b"telegram".as_slice(),
     };
     hash_fields(
         b"cavos-social-policy-v1",

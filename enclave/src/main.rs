@@ -36,6 +36,7 @@ mod oidc;
 mod outbound;
 mod protocol;
 mod sessions;
+mod telegram;
 
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -44,7 +45,8 @@ use anyhow::{anyhow, bail, Context, Result};
 use p256::{ecdsa::SigningKey, SecretKey};
 use protocol::{
     EnclaveConfig, EnclaveRequest, EnclaveResponse, EncryptedJob, GithubGrant, MailConfig,
-    ProviderCredential, SealedRecoveryRecord, SealedResult, WorkloadJob, WorkloadResult,
+    ProviderCredential, SealedRecoveryRecord, SealedResult, TelegramGrant, WorkloadJob,
+    WorkloadResult,
 };
 use reqwest::Client;
 use subtle::ConstantTimeEq;
@@ -225,6 +227,7 @@ fn build_http_client() -> Result<Client> {
         .resolve("securetoken.google.com", oidc)
         .resolve("github.com", oidc)
         .resolve("api.github.com", oidc)
+        .resolve("oauth.telegram.org", oidc)
         // Regional KMS endpoints all resolve through the same proxy; the exact
         // host is set by the configured region at call time.
         .resolve("kms.us-east-1.amazonaws.com", local(KMS_HOST.local_port))
@@ -327,7 +330,7 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
             })
         }
 
-        EnclaveRequest::RunJob { session_id, job, auth_challenge_hash, github } => {
+        EnclaveRequest::RunJob { session_id, job, auth_challenge_hash, github, telegram } => {
             validate_session_id(&session_id)?;
             // Claiming removes the session, so this job cannot be replayed.
             let channel = {
@@ -340,7 +343,14 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
             let (plaintext, response_key) = decrypt_job(&channel, &session_id, job)?;
             let job: WorkloadJob =
                 serde_json::from_slice(&plaintext).context("invalid recovery job")?;
-            let result = process_job(enclave, job, &auth_challenge_hash, github.as_ref()).await?;
+            let result = process_job(
+                enclave,
+                job,
+                &auth_challenge_hash,
+                github.as_ref(),
+                telegram.as_deref(),
+            )
+            .await?;
             let (nonce, ciphertext) =
                 response_key.seal(&serde_json::to_vec(&result)?, &session_id)?;
             let result = match result {
@@ -349,6 +359,9 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
                 }
                 WorkloadResult::GithubVerified { .. } => {
                     WorkloadResult::GithubVerified { id_token: String::new() }
+                }
+                WorkloadResult::TelegramVerified { .. } => {
+                    WorkloadResult::TelegramVerified { id_token: String::new() }
                 }
                 other => other,
             };
@@ -396,6 +409,7 @@ async fn process_job(
     job: WorkloadJob,
     auth_challenge_hash: &str,
     github: Option<&GithubGrant>,
+    telegram: Option<&TelegramGrant>,
 ) -> Result<WorkloadResult> {
     match job {
         WorkloadJob::Enroll { credential, policy, stellar_dek_b64 } => {
@@ -533,6 +547,20 @@ async fn process_job(
             )?;
             Ok(WorkloadResult::GithubVerified { id_token })
         }
+
+        WorkloadJob::VerifyTelegram { code_verifier, login_secret } => {
+            let grant = telegram.ok_or_else(|| anyhow!("telegram grant is missing"))?;
+            validate_login_secret(&login_secret)?;
+            validate_app_id(&grant.app_id)?;
+            validate_bot_id(&grant.bot_id)?;
+            validate_code_verifier(&code_verifier)?;
+            let nonce = format!("{}.{}", grant.app_id, client_nonce_for(&login_secret));
+            let user =
+                telegram::user_for_code(&enclave.http, grant, &code_verifier, &nonce).await?;
+            let id_token =
+                enclave.login.issue_telegram(&user, &grant.bot_id, &nonce, oidc::unix_time()?)?;
+            Ok(WorkloadResult::TelegramVerified { id_token })
+        }
     }
 }
 
@@ -614,6 +642,39 @@ fn validate_client_nonce(nonce: &str) -> Result<()> {
     Ok(())
 }
 
+/// A login secret as the kit makes it: at least 43 and at most 128 base64url
+/// characters, so its hash is never computed over a guessable value.
+fn validate_login_secret(secret: &str) -> Result<()> {
+    if !(43..=128).contains(&secret.len())
+        || !secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
+    {
+        bail!("login secret is malformed");
+    }
+    Ok(())
+}
+
+/// The client's half of a login nonce: `base64url(SHA-256(login_secret))`,
+/// the value the kit sent to the provider and the enclave later checks.
+fn client_nonce_for(login_secret: &str) -> String {
+    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
+    use sha2::{Digest, Sha256};
+    URL_SAFE_NO_PAD.encode(Sha256::digest(login_secret.as_bytes()))
+}
+
+/// A Telegram bot id, which is also its OpenID Connect client id and the
+/// id_token's audience: a positive decimal integer of at most twenty digits.
+fn validate_bot_id(bot_id: &str) -> Result<()> {
+    let canonical = (1..=20).contains(&bot_id.len())
+        && !bot_id.starts_with('0')
+        && bot_id.bytes().all(|byte| byte.is_ascii_digit());
+    if !canonical {
+        bail!("bot id is malformed");
+    }
+    Ok(())
+}
+
 /// The app id is bound into the token's nonce, so it must be a canonical UUID.
 fn validate_app_id(app_id: &str) -> Result<()> {
     let canonical = app_id.len() == 36
@@ -679,9 +740,42 @@ async fn open_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        validate_app_id, validate_client_nonce, validate_code_verifier, validate_send_code,
-        validate_session_id,
+        client_nonce_for, validate_app_id, validate_bot_id, validate_client_nonce,
+        validate_code_verifier, validate_login_secret, validate_send_code, validate_session_id,
     };
+
+    #[test]
+    fn login_secret_is_long_base64url() {
+        assert!(validate_login_secret(&"a".repeat(43)).is_ok());
+        assert!(validate_login_secret(&"A_-9".repeat(32)).is_ok());
+        assert!(validate_login_secret(&"a".repeat(42)).is_err());
+        assert!(validate_login_secret(&"a".repeat(129)).is_err());
+        assert!(validate_login_secret(&format!("{}=", "a".repeat(43))).is_err());
+        assert!(validate_login_secret(&format!("{}.", "a".repeat(43))).is_err());
+        assert!(validate_login_secret("").is_err());
+    }
+
+    #[test]
+    fn client_nonce_is_the_pkce_s256_of_the_secret() {
+        assert_eq!(
+            client_nonce_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
+            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
+        );
+        assert!(validate_client_nonce(&client_nonce_for(&"a".repeat(43))).is_ok());
+    }
+
+    #[test]
+    fn bot_id_is_a_canonical_positive_integer() {
+        assert!(validate_bot_id("8521897198").is_ok());
+        assert!(validate_bot_id("1").is_ok());
+        assert!(validate_bot_id(&"9".repeat(20)).is_ok());
+        assert!(validate_bot_id("").is_err());
+        assert!(validate_bot_id("0").is_err());
+        assert!(validate_bot_id("0123").is_err());
+        assert!(validate_bot_id("12:abc").is_err());
+        assert!(validate_bot_id(&"9".repeat(21)).is_err());
+        assert!(validate_bot_id("-1").is_err());
+    }
 
     #[test]
     fn accepts_uuid_shaped_session_ids() {

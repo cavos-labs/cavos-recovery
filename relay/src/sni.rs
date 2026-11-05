@@ -48,6 +48,8 @@ use tokio_vsock::{VsockAddr, VsockListener, VMADDR_CID_ANY};
 ///
 /// The first four are provider JWKS or discovery hosts, and `github.com` and
 /// `api.github.com` are where the enclave redeems a GitHub authorization code.
+/// `oauth.telegram.org` is where it redeems a Telegram one and fetches the keys
+/// that verify Telegram's id_token.
 /// `dns.google` is the DNS-over-HTTPS resolver the enclave asks for a recipient
 /// domain's MX records when it mails a login code. Separately, any host
 /// starting with `mta-sts.` is allowed, because the enclave fetches the
@@ -63,6 +65,7 @@ const ALLOWED_HOSTS: &[&str] = &[
     "securetoken.google.com",
     "github.com",
     "api.github.com",
+    "oauth.telegram.org",
     "dns.google",
 ];
 
@@ -325,6 +328,9 @@ mod tests {
         assert!(!is_allowed("dns.google.evil.com"));
         assert!(!is_allowed("github.com.evil.com"));
         assert!(!is_allowed("gist.github.com"));
+        assert!(!is_allowed("oauth.telegram.org.evil.com"));
+        assert!(!is_allowed("telegram.org"));
+        assert!(!is_allowed("api.telegram.org"));
         assert!(!is_allowed("169.254.169.254"));
     }
 

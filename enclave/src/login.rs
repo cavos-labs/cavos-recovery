@@ -18,16 +18,20 @@ use serde_json::json;
 use sha2::{Digest, Sha256};
 
 use crate::github::GithubUser;
+use crate::telegram::TelegramUser;
 
 pub const ISSUER: &str = "https://enclave.cavos.xyz";
 pub const AUDIENCE: &str = "cavos-email";
 pub const JWKS_URI: &str = "https://enclave.cavos.xyz/.well-known/jwks.json";
 pub const GITHUB_ISSUER: &str = "https://enclave.cavos.xyz/github";
 pub const GITHUB_AUDIENCE: &str = "cavos-github";
+pub const TELEGRAM_ISSUER: &str = "https://enclave.cavos.xyz/telegram";
+pub const TELEGRAM_AUDIENCE: &str = "cavos-telegram";
 pub const TOKEN_LIFETIME_SECONDS: u64 = 3600;
 
 const SUBJECT_DOMAIN: &str = "cavos-email-subject-v1:";
 const GITHUB_SUBJECT_DOMAIN: &str = "cavos-github-subject-v1:";
+const TELEGRAM_SUBJECT_DOMAIN: &str = "cavos-telegram-subject-v1:";
 
 /// Trim and ASCII-lowercase, the one form of an address used everywhere.
 pub fn normalize_email(email: &str) -> String {
@@ -46,6 +50,17 @@ pub fn subject_id(normalized_email: &str) -> String {
 pub fn github_subject_id(client_id: &str, user_id: u64) -> String {
     hex::encode(Sha256::digest(
         format!("{GITHUB_SUBJECT_DOMAIN}{client_id}:{user_id}").as_bytes(),
+    ))
+}
+
+/// The stable subject of a Telegram identity: lowercase hex SHA-256 over the
+/// domain-separated bot id and Telegram user id. The user id is the `id` claim,
+/// which is the same for every bot, so the bot is mixed in to give each bot its
+/// own identities, as each GitHub OAuth app has. Telegram's own `sub` is not
+/// used: it differs per bot and matches nothing outside OpenID Connect.
+pub fn telegram_subject_id(bot_id: &str, user_id: &str) -> String {
+    hex::encode(Sha256::digest(
+        format!("{TELEGRAM_SUBJECT_DOMAIN}{bot_id}:{user_id}").as_bytes(),
     ))
 }
 
@@ -123,6 +138,34 @@ impl LoginKey {
             "auth_time": now,
             "exp": now + TOKEN_LIFETIME_SECONDS,
         }))
+    }
+
+    /// Sign a login token for a Telegram `user`, bound to `nonce` and to the bot
+    /// whose id_token the enclave verified.
+    pub fn issue_telegram(
+        &self,
+        user: &TelegramUser,
+        bot_id: &str,
+        nonce: &str,
+        now: u64,
+    ) -> Result<String> {
+        let mut claims = json!({
+            "iss": TELEGRAM_ISSUER,
+            "aud": TELEGRAM_AUDIENCE,
+            "sub": telegram_subject_id(bot_id, &user.id),
+            "azp": bot_id,
+            "nonce": nonce,
+            "iat": now,
+            "auth_time": now,
+            "exp": now + TOKEN_LIFETIME_SECONDS,
+        });
+        if let Some(name) = user.name.as_deref().or(user.preferred_username.as_deref()) {
+            claims["name"] = json!(name);
+        }
+        if let Some(username) = user.preferred_username.as_deref() {
+            claims["preferred_username"] = json!(username);
+        }
+        self.sign(&claims)
     }
 
     fn sign(&self, claims: &serde_json::Value) -> Result<String> {
@@ -243,6 +286,67 @@ mod tests {
         .unwrap();
         assert_eq!(claims["name"], "The Octocat");
         assert_eq!(claims["preferred_username"], "octocat");
+    }
+
+    #[test]
+    fn telegram_subject_is_domain_separated_and_differs_per_bot() {
+        let expected = hex::encode(Sha256::digest(b"cavos-telegram-subject-v1:8521897198:123456789"));
+        assert_eq!(telegram_subject_id("8521897198", "123456789"), expected);
+        assert_ne!(
+            telegram_subject_id("8521897198", "123456789"),
+            telegram_subject_id("8521897199", "123456789")
+        );
+        assert_ne!(
+            telegram_subject_id("8521897198", "123456789"),
+            telegram_subject_id("8521897198", "123456780")
+        );
+        assert_ne!(telegram_subject_id("85218971", "98123"), telegram_subject_id("8521897198", "123"));
+        assert_ne!(telegram_subject_id("1", "2"), github_subject_id("1", 2));
+    }
+
+    #[test]
+    fn telegram_token_has_the_contract_shape() {
+        let key = test_key(7);
+        let user = TelegramUser {
+            id: "123456789".into(),
+            name: Some("Ada".into()),
+            preferred_username: Some("ada".into()),
+        };
+        let token = key.issue_telegram(&user, "8521897198", "app.nonce", 1_790_000_000).unwrap();
+        let parts: Vec<&str> = token.split('.').collect();
+        let header: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[0]).unwrap()).unwrap();
+        assert_eq!(header, json!({ "alg": "ES256", "typ": "JWT", "kid": key.kid() }));
+        let claims: serde_json::Value =
+            serde_json::from_slice(&URL_SAFE_NO_PAD.decode(parts[1]).unwrap()).unwrap();
+        assert_eq!(
+            claims,
+            json!({
+                "iss": "https://enclave.cavos.xyz/telegram",
+                "aud": "cavos-telegram",
+                "sub": telegram_subject_id("8521897198", "123456789"),
+                "azp": "8521897198",
+                "name": "Ada",
+                "preferred_username": "ada",
+                "nonce": "app.nonce",
+                "iat": 1_790_000_000u64,
+                "auth_time": 1_790_000_000u64,
+                "exp": 1_790_003_600u64,
+            })
+        );
+    }
+
+    #[test]
+    fn telegram_token_omits_names_it_was_not_given() {
+        let key = test_key(7);
+        let user = TelegramUser { id: "1".into(), name: None, preferred_username: None };
+        let token = key.issue_telegram(&user, "2", "n", 1).unwrap();
+        let claims: serde_json::Value = serde_json::from_slice(
+            &URL_SAFE_NO_PAD.decode(token.split('.').nth(1).unwrap()).unwrap(),
+        )
+        .unwrap();
+        assert!(claims.get("name").is_none());
+        assert!(claims.get("preferred_username").is_none());
     }
 
     #[test]

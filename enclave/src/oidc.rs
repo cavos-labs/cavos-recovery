@@ -5,7 +5,7 @@ use crate::login::{self, LoginKey};
 use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
 use jsonwebtoken::{
     decode, decode_header,
-    jwk::{AlgorithmParameters, JwkSet},
+    jwk::{AlgorithmParameters, EllipticCurve, Jwk, KeyAlgorithm},
     Algorithm, DecodingKey, Validation,
 };
 use serde::Deserialize;
@@ -73,7 +73,7 @@ pub async fn verify_id_token(
         .context("OIDC token omitted kid")
         .context(Failure::SignatureRejected)?;
     let (algorithm, decoding_key) = match policy.provider {
-        SocialProvider::Email | SocialProvider::Github => {
+        SocialProvider::Email | SocialProvider::Github | SocialProvider::Telegram => {
             if kid != login.kid() {
                 return Err(anyhow!("login token names an unknown key")
                     .context(Failure::SignatureRejected));
@@ -111,49 +111,95 @@ pub async fn verify_id_token(
     Ok(claims)
 }
 
+/// The most a provider may send in one response, measured after decompression.
+pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 64 * 1024;
+
 async fn provider_key(
     http: &reqwest::Client,
     policy: &RecoveryPolicy,
     kid: &str,
 ) -> Result<(Algorithm, DecodingKey)> {
-    let jwks: JwkSet = http
-        .get(&policy.jwks_uri)
+    jwks_key(http, &policy.jwks_uri, kid).await
+}
+
+/// Fetch the key set at `jwks_uri` and return the verifying key named `kid`.
+///
+/// The set is read as plain JSON and only the named key is parsed as a JWK.
+/// Parsing the whole set as a `JwkSet` fails when any one key has a type
+/// `jsonwebtoken` does not know, and Telegram's set carries an ES256K key.
+pub async fn jwks_key(
+    http: &reqwest::Client,
+    jwks_uri: &str,
+    kid: &str,
+) -> Result<(Algorithm, DecodingKey)> {
+    let response = http
+        .get(jwks_uri)
         .send()
         .await
         .context("JWKS request failed")
         .context(Failure::JwksUnreachable)?
         .error_for_status()
         .context("JWKS endpoint rejected request")
-        .context(Failure::JwksUnreachable)?
-        .json()
+        .context(Failure::JwksUnreachable)?;
+    let body = read_limited(response, MAX_PROVIDER_RESPONSE_BYTES)
         .await
+        .context(Failure::JwksUnreachable)?;
+    let jwks: serde_json::Value = serde_json::from_slice(&body)
         .context("invalid JWKS")
         .context(Failure::JwksUnreachable)?;
-    let jwk = jwks
-        .keys
-        .iter()
-        .find(|key| key.common.key_id.as_deref() == Some(kid))
-        .context("OIDC signing key not found")
-        .context(Failure::SignatureRejected)?;
+    key_for_kid(&jwks, kid).context(Failure::SignatureRejected)
+}
 
-    let (algorithm, decoding_key) = match &jwk.algorithm {
+/// The key named `kid` in a JWKS document, as an RS256 key or a P-256 ES256
+/// key. A key whose own `alg` disagrees with its type, an EC key on another
+/// curve, or any other key type is refused.
+fn key_for_kid(jwks: &serde_json::Value, kid: &str) -> Result<(Algorithm, DecodingKey)> {
+    let entry = jwks
+        .get("keys")
+        .and_then(serde_json::Value::as_array)
+        .context("JWKS has no key list")?
+        .iter()
+        .find(|key| key.get("kid").and_then(serde_json::Value::as_str) == Some(kid))
+        .context("OIDC signing key not found")?;
+    let jwk: Jwk = serde_json::from_value(entry.clone()).context("unsupported OIDC signing key")?;
+    let (algorithm, key_algorithm, decoding_key) = match &jwk.algorithm {
         AlgorithmParameters::RSA(rsa) => (
             Algorithm::RS256,
-            DecodingKey::from_rsa_components(&rsa.n, &rsa.e)
-                .context("invalid RSA JWK")?,
+            KeyAlgorithm::RS256,
+            DecodingKey::from_rsa_components(&rsa.n, &rsa.e).context("invalid RSA JWK")?,
         ),
         AlgorithmParameters::EllipticCurve(ec) => {
+            if ec.curve != EllipticCurve::P256 {
+                bail!("EC signing key is not on P-256");
+            }
             let x = URL_SAFE_NO_PAD.decode(&ec.x)?;
             let y = URL_SAFE_NO_PAD.decode(&ec.y)?;
             (
                 Algorithm::ES256,
+                KeyAlgorithm::ES256,
                 DecodingKey::from_ec_components(&URL_SAFE_NO_PAD.encode(x), &URL_SAFE_NO_PAD.encode(y))
                     .context("invalid EC JWK")?,
             )
         }
         _ => bail!("unsupported OIDC signing key type"),
     };
+    if jwk.common.key_algorithm.is_some_and(|declared| declared != key_algorithm) {
+        bail!("JWK alg does not match its key type");
+    }
     Ok((algorithm, decoding_key))
+}
+
+/// Read a response body, refusing one larger than `limit` bytes. The limit
+/// applies to the decompressed body, so a small gzip cannot expand past it.
+pub async fn read_limited(mut response: reqwest::Response, limit: usize) -> Result<Vec<u8>> {
+    let mut body = Vec::new();
+    while let Some(chunk) = response.chunk().await.context("response body could not be read")? {
+        if body.len() + chunk.len() > limit {
+            bail!("response is larger than {limit} bytes");
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body)
 }
 
 /// Length of a base64url-encoded SHA-256, and the least a login secret may be.
@@ -275,6 +321,11 @@ fn validate_provider_policy(policy: &RecoveryPolicy) -> Result<()> {
         SocialProvider::Github => {
             policy.issuer == login::GITHUB_ISSUER
                 && policy.audience == login::GITHUB_AUDIENCE
+                && policy.jwks_uri == login::JWKS_URI
+        }
+        SocialProvider::Telegram => {
+            policy.issuer == login::TELEGRAM_ISSUER
+                && policy.audience == login::TELEGRAM_AUDIENCE
                 && policy.jwks_uri == login::JWKS_URI
         }
     };
@@ -427,6 +478,69 @@ mod tests {
             audience: login::AUDIENCE.into(),
             jwks_uri: login::JWKS_URI.into(),
         }
+    }
+
+    #[test]
+    fn telegram_policy_must_match_the_enclave_contract() {
+        let mut policy = email_policy();
+        policy.provider = SocialProvider::Telegram;
+        policy.issuer = login::TELEGRAM_ISSUER.into();
+        policy.audience = login::TELEGRAM_AUDIENCE.into();
+        assert!(validate_provider_policy(&policy).is_ok());
+
+        let mut wrong_issuer = policy.clone();
+        wrong_issuer.issuer = login::GITHUB_ISSUER.into();
+        let mut wrong_audience = policy.clone();
+        wrong_audience.audience = login::GITHUB_AUDIENCE.into();
+        let mut telegram_itself = policy.clone();
+        telegram_itself.issuer = "https://oauth.telegram.org".into();
+        telegram_itself.jwks_uri = "https://oauth.telegram.org/.well-known/jwks.json".into();
+        for policy in [wrong_issuer, wrong_audience, telegram_itself] {
+            assert!(validate_provider_policy(&policy).is_err());
+        }
+    }
+
+    fn telegram_jwks() -> serde_json::Value {
+        serde_json::from_str(include_str!("testdata/telegram_jwks.json")).unwrap()
+    }
+
+    #[test]
+    fn the_whole_telegram_key_set_is_not_a_jwk_set() {
+        assert!(serde_json::from_value::<jsonwebtoken::jwk::JwkSet>(telegram_jwks()).is_err());
+    }
+
+    #[test]
+    fn telegram_rsa_and_p256_keys_are_found_by_kid() {
+        let jwks = telegram_jwks();
+        assert_eq!(key_for_kid(&jwks, "oidc-1").unwrap().0, Algorithm::RS256);
+        assert_eq!(key_for_kid(&jwks, "oidc-es256-1").unwrap().0, Algorithm::ES256);
+    }
+
+    #[test]
+    fn telegram_keys_on_other_curves_are_refused() {
+        let jwks = telegram_jwks();
+        for kid in ["oidc-es256k-1", "oidc-eddsa-1", "oidc-unknown"] {
+            assert!(key_for_kid(&jwks, kid).is_err(), "{kid}");
+        }
+    }
+
+    #[test]
+    fn a_key_whose_alg_disagrees_with_its_type_is_refused() {
+        let mut jwks = telegram_jwks();
+        let keys = jwks["keys"].as_array_mut().unwrap();
+        let ec = keys.iter_mut().find(|key| key["kid"] == "oidc-es256-1").unwrap();
+        ec["alg"] = "RS256".into();
+        let mut p384 = ec.clone();
+        p384["kid"] = "p384".into();
+        p384["crv"] = "P-384".into();
+        p384["alg"] = "ES384".into();
+        let rsa = keys.iter_mut().find(|key| key["kid"] == "oidc-1").unwrap();
+        rsa["alg"] = "PS256".into();
+        jwks["keys"].as_array_mut().unwrap().push(p384);
+        for kid in ["oidc-es256-1", "oidc-1", "p384"] {
+            assert!(key_for_kid(&jwks, kid).is_err(), "{kid}");
+        }
+        assert!(key_for_kid(&serde_json::json!({}), "oidc-1").is_err());
     }
 
     #[test]

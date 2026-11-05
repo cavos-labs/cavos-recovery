@@ -146,7 +146,7 @@ variable "host_count_us_east_1" {
     funds are at risk either way.
   EOT
   type        = number
-  default     = 1
+  default     = 0
 
   validation {
     condition     = var.host_count_us_east_1 >= 0 && var.host_count_us_east_1 <= 1
@@ -162,7 +162,7 @@ variable "host_count_us_east_2" {
     once, and var.host_count_us_east_1 goes to 0 after the DNS cutover.
   EOT
   type        = number
-  default     = 0
+  default     = 1
 
   validation {
     condition     = var.host_count_us_east_2 >= 0 && var.host_count_us_east_2 <= 1

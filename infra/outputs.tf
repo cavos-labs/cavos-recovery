@@ -50,3 +50,8 @@ output "autoscaling_group_us_east_2" {
   description = "The us-east-2 host's autoscaling group; same lookup as above with `--region us-east-2`."
   value       = module.host_us_east_2.autoscaling_group
 }
+
+output "security_alerts_topic_arn" {
+  description = "SNS topic (default region) that receives the custody-relevant security alerts. The email subscription must be confirmed once."
+  value       = aws_sns_topic.security_alerts.arn
+}

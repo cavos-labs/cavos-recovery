@@ -243,7 +243,6 @@ async fn serve_config(mail: Option<MailSettings>) -> Result<()> {
 
 #[derive(serde::Serialize)]
 struct EnclaveConfig {
-    region: String,
     wrapped_root_key_b64: String,
     access_key_id: String,
     secret_access_key: String,
@@ -324,7 +323,6 @@ async fn load_config(
         None => None,
     };
     Ok(EnclaveConfig {
-        region: region.to_string(),
         wrapped_root_key_b64: wrapped,
         access_key_id: creds.access_key_id,
         secret_access_key: creds.secret_access_key,

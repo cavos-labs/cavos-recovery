@@ -106,6 +106,11 @@ variable "enclave_pcr0" {
     condition     = can(regex("^[0-9a-f]{96}$", var.enclave_pcr0))
     error_message = "PCR0 must be 96 lowercase hex characters (a SHA-384 digest)."
   }
+
+  validation {
+    condition     = var.enclave_pcr0 != join("", [for _ in range(96) : "0"])
+    error_message = "PCR0 must not be all zeros. That is what an enclave started in debug mode reports, and the key policy must never trust it."
+  }
 }
 
 variable "hostname" {
@@ -231,4 +236,20 @@ variable "mail_dkim_selector" {
   description = "DKIM selector whose public key is published under the mail_sender domain. Required when mail_from is set."
   type        = string
   default     = "otp2"
+}
+
+variable "security_alert_email" {
+  description = <<-EOT
+    Where custody-relevant alerts are delivered: KMS key policy, grant and
+    deletion changes, unexpected use of the root key, Parameter Store changes to
+    the wrapped root key, audit tampering and interactive host access. Pass it
+    with `-var` or `TF_VAR_security_alert_email`; the subscription must be
+    confirmed once from that inbox before anything is delivered.
+  EOT
+  type        = string
+
+  validation {
+    condition     = length(var.security_alert_email) > 0 && can(regex("@", var.security_alert_email))
+    error_message = "security_alert_email must be a non-empty email address."
+  }
 }

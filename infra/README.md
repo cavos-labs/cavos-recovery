@@ -129,6 +129,14 @@ terraform would write its plaintext into state, and state is a file that gets
 copied to laptops and CI. The script uses `generate-data-key-without-plaintext`,
 so the plaintext is created inside KMS and never exists anywhere else.
 
+The enclave names its KMS key itself: `ROOT_KEY_ARN` in `enclave/src/kms.rs`
+must equal `terraform output kms_key_arn`, and an enclave built with a
+different ARN fails closed at boot. The root key is also wrapped under the
+encryption context `purpose=cavos-recovery-root-key-v1`. A root key wrapped
+before this was added has no context and cannot be unwrapped by the new image,
+so adopting this release means re-running `bootstrap-secrets.sh`, which
+replaces the root key and makes every previously sealed record unreadable.
+
 Then upload the artifacts and point DNS at the instance:
 
 ```bash
@@ -205,3 +213,27 @@ are all outside the trust boundary:
   the key policy requires an attestation the parent cannot produce.
 
 A compromise of the host denies service. It does not read credentials.
+
+## Security alerts
+
+`alerts.tf` sends email (EventBridge, then SNS, in us-east-1 and us-east-2) when
+any of these happens:
+
+- KMS key governance on any key in the account: `PutKeyPolicy`, grants created
+  (except by Auto Scaling) or retired/revoked, key deletion scheduled or
+  cancelled, disable/enable, replication, key material import, `CreateKey`.
+- The root key used by anyone other than the instance role.
+- `PutParameter`, `DeleteParameter(s)` or `LabelParameterVersion` on anything
+  under `/cavos-recovery/`. `bootstrap-secrets.sh` triggers this by design.
+- Tampering with the audit path: CloudTrail, EventBridge rules and targets, SNS
+  topics and subscriptions. A `terraform apply` that touches these resources
+  fires it too.
+- Interactive host access: SSM `StartSession`, `SendCommand`, `ResumeSession`.
+
+`security_alert_email` has no default: pass it with `-var` or
+`TF_VAR_security_alert_email`. SNS sends a confirmation message to each region's
+subscription; click it once from the inbox (two emails, one per region), or
+nothing is delivered.
+
+These alerts detect, they do not prevent. An account administrator can still
+rewrite the key policy and obtain the root key; the alert only makes it loud.

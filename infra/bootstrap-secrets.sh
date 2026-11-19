@@ -21,6 +21,7 @@ echo "==> Generating the wrapped root key"
 wrapped=$(aws kms generate-data-key-without-plaintext \
   --key-id "$key_arn" \
   --key-spec AES_256 \
+  --encryption-context "purpose=cavos-recovery-root-key-v1" \
   --region "$REGION" \
   --query CiphertextBlob --output text)
 

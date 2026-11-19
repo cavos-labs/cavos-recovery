@@ -8,6 +8,12 @@
 //! guesses: an exhausted entry stays until it expires, so guessing cannot be
 //! used to reset the cooldown.
 //!
+//! A code is also bound to the login key that asked for it. A guess made under
+//! any other key gets `None` whatever the code, so it reveals nothing, and it
+//! leaves the entry untouched: it costs no attempt, so a third party who knows
+//! the address cannot use up the legitimate user's attempts. Only guesses under
+//! the bound key are charged.
+//!
 //! The store never talks to the network. The caller reserves an entry, sends
 //! the mail without holding the lock, and removes the entry if sending failed.
 
@@ -28,6 +34,7 @@ const MAX_CODES: usize = 4_096;
 struct Entry {
     code: Zeroizing<String>,
     app_id: String,
+    login_binding: String,
     attempts_left: u8,
     sent_at: Instant,
     expires_at: Instant,
@@ -78,6 +85,7 @@ impl CodeStore {
         &mut self,
         email: &str,
         app_id: &str,
+        login_binding: &str,
         code: Zeroizing<String>,
         now: Instant,
     ) -> Result<(), CodeError> {
@@ -95,6 +103,7 @@ impl CodeStore {
             Entry {
                 code,
                 app_id: app_id.to_owned(),
+                login_binding: login_binding.to_owned(),
                 attempts_left: MAX_ATTEMPTS,
                 sent_at: now,
                 expires_at: now + CODE_TTL,
@@ -108,11 +117,22 @@ impl CodeStore {
         self.entries.remove(email);
     }
 
-    /// Check a guess. A correct one consumes the entry and returns the app it
-    /// was issued for; a wrong one costs an attempt.
-    pub fn verify(&mut self, email: &str, guess: &str, now: Instant) -> Option<String> {
+    /// Check a guess made under the login key `channel_binding`. Under any key
+    /// but the one the code was requested with, the answer is `None` and the
+    /// entry is unchanged. Under that key, a correct code consumes the entry and
+    /// returns the app it was issued for, and a wrong one costs an attempt.
+    pub fn verify(
+        &mut self,
+        email: &str,
+        guess: &str,
+        channel_binding: &str,
+        now: Instant,
+    ) -> Option<String> {
         self.expire(now);
         let entry = self.entries.get_mut(email)?;
+        if !bool::from(entry.login_binding.as_bytes().ct_eq(channel_binding.as_bytes())) {
+            return None;
+        }
         if entry.attempts_left == 0 {
             return None;
         }
@@ -145,6 +165,8 @@ mod tests {
     use super::*;
 
     const APP: &str = "0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f";
+    const KEY: &str = "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM";
+    const OTHER_KEY: &str = "M25iVXpKU3puUjFaYWg3T1NDTDQtcW1ROUY5YXlwalNo";
 
     fn code(value: &str) -> Zeroizing<String> {
         Zeroizing::new(value.to_owned())
@@ -180,27 +202,52 @@ mod tests {
     fn a_correct_guess_returns_the_app_and_consumes_the_code() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
-        assert_eq!(store.verify("a@b.co", "QPZ-RY9X8G", now).as_deref(), Some(APP));
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
+        assert_eq!(store.verify("a@b.co", "QPZ-RY9X8G", KEY, now).as_deref(), Some(APP));
         assert_eq!(store.len(), 0);
-        assert_eq!(store.verify("a@b.co", "qpzry9x8g", now), None);
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, now), None);
+    }
+
+    #[test]
+    fn the_right_code_under_another_key_fails_and_does_not_consume_the_code() {
+        let mut store = CodeStore::new();
+        let now = Instant::now();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", OTHER_KEY, now), None);
+        assert_eq!(store.len(), 1);
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, now).as_deref(), Some(APP));
+    }
+
+    #[test]
+    fn guesses_under_another_key_never_cost_the_bound_keys_attempts() {
+        let mut store = CodeStore::new();
+        let now = Instant::now();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
+        for _ in 0..10 {
+            assert_eq!(store.verify("a@b.co", "qpzry9x8g", OTHER_KEY, now), None);
+            assert_eq!(store.verify("a@b.co", "wrong", OTHER_KEY, now), None);
+        }
+        for _ in 0..2 {
+            assert_eq!(store.verify("a@b.co", "wrong", KEY, now), None);
+        }
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, now).as_deref(), Some(APP));
     }
 
     #[test]
     fn unknown_addresses_are_rejected() {
         let mut store = CodeStore::new();
-        assert_eq!(store.verify("nobody@b.co", "qpzry9x8g", Instant::now()), None);
+        assert_eq!(store.verify("nobody@b.co", "qpzry9x8g", KEY, Instant::now()), None);
     }
 
     #[test]
     fn three_wrong_guesses_exhaust_the_code_even_for_the_right_one() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
         for _ in 0..3 {
-            assert_eq!(store.verify("a@b.co", "00000000g", now), None);
+            assert_eq!(store.verify("a@b.co", "00000000g", KEY, now), None);
         }
-        assert_eq!(store.verify("a@b.co", "qpzry9x8g", now), None);
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, now), None);
         assert_eq!(store.len(), 1, "an exhausted entry stays until it expires");
     }
 
@@ -208,18 +255,18 @@ mod tests {
     fn a_wrong_guess_leaves_the_code_usable() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
-        assert_eq!(store.verify("a@b.co", "wrong", now), None);
-        assert_eq!(store.verify("a@b.co", "qpzry9x8g", now).as_deref(), Some(APP));
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
+        assert_eq!(store.verify("a@b.co", "wrong", KEY, now), None);
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, now).as_deref(), Some(APP));
     }
 
     #[test]
     fn codes_expire() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
         let later = now + CODE_TTL;
-        assert_eq!(store.verify("a@b.co", "qpzry9x8g", later), None);
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, later), None);
         assert_eq!(store.len(), 0);
     }
 
@@ -227,27 +274,27 @@ mod tests {
     fn a_new_code_waits_out_the_cooldown_then_replaces_the_old_one() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
         assert_eq!(
-            store.reserve("a@b.co", APP, code("2222222222"), now + Duration::from_secs(59)),
+            store.reserve("a@b.co", APP, KEY, code("2222222222"), now + Duration::from_secs(59)),
             Err(CodeError::Cooldown)
         );
         let later = now + RESEND_COOLDOWN;
-        store.reserve("a@b.co", APP, code("2222222222"), later).unwrap();
-        assert_eq!(store.verify("a@b.co", "qpzry9x8g", later), None);
-        assert_eq!(store.verify("a@b.co", "2222222222", later).as_deref(), Some(APP));
+        store.reserve("a@b.co", APP, KEY, code("2222222222"), later).unwrap();
+        assert_eq!(store.verify("a@b.co", "qpzry9x8g", KEY, later), None);
+        assert_eq!(store.verify("a@b.co", "2222222222", KEY, later).as_deref(), Some(APP));
     }
 
     #[test]
     fn exhausting_a_code_does_not_skip_the_cooldown() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
         for _ in 0..3 {
-            store.verify("a@b.co", "wrong", now);
+            store.verify("a@b.co", "wrong", KEY, now);
         }
         assert_eq!(
-            store.reserve("a@b.co", APP, code("2222222222"), now),
+            store.reserve("a@b.co", APP, KEY, code("2222222222"), now),
             Err(CodeError::Cooldown)
         );
     }
@@ -256,9 +303,9 @@ mod tests {
     fn a_failed_send_can_be_retried_at_once() {
         let mut store = CodeStore::new();
         let now = Instant::now();
-        store.reserve("a@b.co", APP, code("qpzry9x8g"), now).unwrap();
+        store.reserve("a@b.co", APP, KEY, code("qpzry9x8g"), now).unwrap();
         store.release("a@b.co");
-        assert!(store.reserve("a@b.co", APP, code("2222222222"), now).is_ok());
+        assert!(store.reserve("a@b.co", APP, KEY, code("2222222222"), now).is_ok());
     }
 
     #[test]
@@ -266,14 +313,14 @@ mod tests {
         let mut store = CodeStore::new();
         let now = Instant::now();
         for index in 0..MAX_CODES {
-            store.reserve(&format!("u{index}@b.co"), APP, code("qpzry9x8g"), now).unwrap();
+            store.reserve(&format!("u{index}@b.co"), APP, KEY, code("qpzry9x8g"), now).unwrap();
         }
         assert_eq!(
-            store.reserve("extra@b.co", APP, code("qpzry9x8g"), now),
+            store.reserve("extra@b.co", APP, KEY, code("qpzry9x8g"), now),
             Err(CodeError::AtCapacity)
         );
         assert!(store
-            .reserve("u0@b.co", APP, code("qpzry9x8g"), now + RESEND_COOLDOWN)
+            .reserve("u0@b.co", APP, KEY, code("qpzry9x8g"), now + RESEND_COOLDOWN)
             .is_ok());
     }
 
@@ -282,9 +329,9 @@ mod tests {
         let mut store = CodeStore::new();
         let now = Instant::now();
         for index in 0..MAX_CODES {
-            store.reserve(&format!("u{index}@b.co"), APP, code("qpzry9x8g"), now).unwrap();
+            store.reserve(&format!("u{index}@b.co"), APP, KEY, code("qpzry9x8g"), now).unwrap();
         }
-        assert!(store.reserve("fresh@b.co", APP, code("qpzry9x8g"), now + CODE_TTL).is_ok());
+        assert!(store.reserve("fresh@b.co", APP, KEY, code("qpzry9x8g"), now + CODE_TTL).is_ok());
         assert_eq!(store.len(), 1);
     }
 }

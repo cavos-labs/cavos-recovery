@@ -29,6 +29,16 @@ jobs:
           fi
           echo "VERSION=${TAG#v}" >> "$GITHUB_ENV"
 
+      - name: Require a commit on main
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          status=$(gh api "repos/$GITHUB_REPOSITORY/compare/main...$GITHUB_SHA" --jq .status)
+          if [[ $status != behind && $status != identical ]]; then
+            echo "Commit $GITHUB_SHA is not on main (compare status: $status)." >&2
+            exit 1
+          fi
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1
         with:
           persist-credentials: false
@@ -123,6 +133,8 @@ jobs:
             --title "$TAG" \
             --notes-file notes.md \
             --verify-tag \
+            --draft \
             enclave/build/enclave.eif \
             "enclave-${PCR0}.sigstore.json" \
             enclave/build/measurements.json
+          gh release edit "$TAG" --draft=false

@@ -19,11 +19,6 @@ pub struct ProviderCredential {
     /// Base64url SHA-256 of `id_token`. The control plane stores only a second
     /// SHA-256 of this value to enforce single use.
     pub token_fingerprint: String,
-    /// The secret whose hash the client sent as the login `nonce`. It never
-    /// leaves the client except inside this encrypted job, so holding the token
-    /// alone is not enough to use it. Required for every provider.
-    #[serde(default)]
-    pub nonce_preimage: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -65,25 +60,25 @@ pub enum WorkloadJob {
         stellar_dek_b64: Option<String>,
     },
     /// Trade the code the enclave mailed for a token signed by the enclave.
+    ///
+    /// The code is redeemed only when this job's channel key is the one named
+    /// by the `login_binding` of the `send_code` that mailed it. The token's
+    /// nonce is `<app_id>.<channel binding>` of that key (see
+    /// `crypto::channel_binding`), so only its holder can use it.
     VerifyEmail {
         email: String,
         code: String,
-        client_nonce: String,
     },
-    /// Trade a GitHub authorization code for a token signed by the enclave.
+    /// Trade a GitHub authorization code for a token signed by the enclave,
+    /// bound to the job's channel key as for `verify_email`.
     VerifyGithub {
         code_verifier: String,
-        client_nonce: String,
     },
-    /// Trade a Telegram authorization code for a token signed by the enclave.
-    ///
-    /// Unlike `verify_github`, the job carries the login secret itself rather
-    /// than its hash. The hash is public (it is the `nonce` in the authorize
-    /// URL), so a job that only had to name it could be built by anyone who
-    /// saw the code. The secret is something only the client holds.
+    /// Trade a Telegram authorization code for a token signed by the enclave,
+    /// bound to the job's channel key as for `verify_email`. Telegram also
+    /// checks the same nonce in its own id_token.
     VerifyTelegram {
         code_verifier: String,
-        login_secret: String,
     },
 }
 
@@ -303,10 +298,16 @@ pub enum EnclaveRequest {
         telegram: Option<Box<TelegramGrant>>,
     },
     /// Generate a one-time code and mail it to `email`.
+    ///
+    /// `login_binding` is the channel binding (`crypto::channel_binding`) of the
+    /// login key the client is signing in with. The code can only be redeemed
+    /// by a `verify_email` job encrypted under that same key, so a script that
+    /// learns the address and the typed code cannot trade them under its own.
     SendCode {
         email: String,
         app_id: String,
         app_name: String,
+        login_binding: String,
     },
     /// The public keys that verify tokens this enclave issues.
     LoginKeys,

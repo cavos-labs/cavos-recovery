@@ -60,6 +60,7 @@ pub async fn verify_id_token(
     credential: &ProviderCredential,
     policy: &RecoveryPolicy,
     expected_auth_challenge_hash: &str,
+    channel_binding: &str,
 ) -> Result<IdentityClaims> {
     validate_provider_policy(policy).context(Failure::PolicyRejected)?;
     verify_credential_binding(credential, expected_auth_challenge_hash)
@@ -107,7 +108,7 @@ pub async fn verify_id_token(
         return Err(anyhow!("email identity is not verified").context(Failure::ClaimsRejected));
     }
     enforce_recent_auth(&claims, unix_time()?).context(Failure::AuthStale)?;
-    verify_login_binding(&claims, credential, policy).context(Failure::CredentialBinding)?;
+    verify_login_binding(&claims, channel_binding, policy).context(Failure::CredentialBinding)?;
     Ok(claims)
 }
 
@@ -202,21 +203,26 @@ pub async fn read_limited(mut response: reqwest::Response, limit: usize) -> Resu
     Ok(body)
 }
 
-/// Length of a base64url-encoded SHA-256, and the least a login secret may be.
-const HASH_B64_LEN: usize = 43;
+/// The `nonce` a login token carries: `<app_id>.<channel binding>`. The enclave
+/// both issues tokens with it and checks tokens against it.
+pub fn login_nonce(app_id: &str, channel_binding: &str) -> String {
+    format!("{app_id}.{channel_binding}")
+}
 
-/// Check that this token was minted for this app, at the request of whoever
-/// holds the login secret.
+/// Check that this token was minted for this app, for whoever holds the
+/// private half of the key this job was encrypted under.
 ///
 /// The provider signs one value the client chooses: the `nonce`. The login
-/// sends `<app_id>.<base64url(SHA-256(secret))>`, where the control plane
-/// supplies the app after validating it and the client supplies the hash
-/// (OpenID Connect Core §15.5.2; the hash is PKCE's S256, RFC 7636 §4.2).
+/// sends `<app_id>.<channel binding>`, where the control plane supplies the app
+/// after validating it and the binding is the hash of the client's channel
+/// public key (`crypto::channel_binding`; OpenID Connect Core §15.5.2). A job
+/// that decrypted under that key proves possession of its private half, the
+/// way a DPoP proof does.
 ///
 /// Both halves matter. Without the app, a token one app obtains for a user is
 /// good against that user's wallet in every other app, since they share an
-/// audience. Without the secret, anyone who sees the token in transit can
-/// spend it.
+/// audience. Without the key, anyone who sees the token in transit can spend
+/// it.
 ///
 /// Apple is also accepted with the nonce hashed once more, hex-encoded, which
 /// is the second form the control plane's callback already tolerates. Either
@@ -224,20 +230,11 @@ const HASH_B64_LEN: usize = 43;
 /// nothing.
 fn verify_login_binding(
     claims: &IdentityClaims,
-    credential: &ProviderCredential,
+    channel_binding: &str,
     policy: &RecoveryPolicy,
 ) -> Result<()> {
-    let secret = credential
-        .nonce_preimage
-        .as_deref()
-        .filter(|secret| secret.len() >= HASH_B64_LEN)
-        .context("credential carries no login secret")?;
     let nonce = claims.nonce.as_deref().context("OIDC token carries no nonce")?;
-    let expected = format!(
-        "{}.{}",
-        policy.app_id,
-        URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes()))
-    );
+    let expected = login_nonce(&policy.app_id, channel_binding);
 
     let matches = |candidate: &str| bool::from(nonce.as_bytes().ct_eq(candidate.as_bytes()));
     if matches(&expected)
@@ -344,6 +341,11 @@ fn validate_provider_policy(policy: &RecoveryPolicy) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto;
+    use p256::{
+        ecdh::EphemeralSecret, elliptic_curve::sec1::ToEncodedPoint, PublicKey,
+    };
+    use rand_core::OsRng;
 
     fn claims(issued_at: u64, nonce: Option<&str>) -> IdentityClaims {
         IdentityClaims {
@@ -366,7 +368,6 @@ mod tests {
             provider: SocialProvider::Google,
             id_token: token.into(),
             token_fingerprint: fingerprint.clone(),
-            nonce_preimage: None,
         };
         let expected = hex_sha256(fingerprint.as_bytes());
         assert!(verify_credential_binding(&credential, &expected).is_ok());
@@ -384,8 +385,6 @@ mod tests {
     }
 
     const APP: &str = "0f9d5a1c-3b2e-4c5a-8d7f-1a2b3c4d5e6f";
-    const SECRET: &str = "dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk";
-
     fn policy(provider: SocialProvider) -> RecoveryPolicy {
         RecoveryPolicy {
             app_id: APP.into(),
@@ -397,76 +396,74 @@ mod tests {
         }
     }
 
-    fn credential(provider: SocialProvider, secret: Option<&str>) -> ProviderCredential {
-        ProviderCredential {
-            provider,
-            id_token: "header.payload.signature".into(),
-            token_fingerprint: String::new(),
-            nonce_preimage: secret.map(str::to_owned),
-        }
+    fn channel_key() -> Vec<u8> {
+        PublicKey::from(&EphemeralSecret::random(&mut OsRng))
+            .to_encoded_point(false)
+            .as_bytes()
+            .to_vec()
     }
 
-    fn bound_nonce(app: &str, secret: &str) -> String {
-        format!("{app}.{}", URL_SAFE_NO_PAD.encode(Sha256::digest(secret.as_bytes())))
+    fn binding_of(key: &[u8]) -> String {
+        crypto::channel_binding(key).unwrap()
     }
 
-    fn binding(provider: SocialProvider, nonce: Option<&str>, secret: Option<&str>) -> Result<()> {
-        verify_login_binding(
-            &claims(2_000_000_000, nonce),
-            &credential(provider.clone(), secret),
-            &policy(provider),
-        )
+    fn bound_nonce(app: &str, binding: &str) -> String {
+        format!("{app}.{binding}")
     }
 
-    #[test]
-    fn hash_matches_the_pkce_s256_vector() {
-        // RFC 7636 Appendix B: this verifier hashes to this challenge.
-        assert_eq!(
-            URL_SAFE_NO_PAD.encode(Sha256::digest(SECRET.as_bytes())),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM",
-        );
+    fn binding(provider: SocialProvider, nonce: Option<&str>, channel_binding: &str) -> Result<()> {
+        verify_login_binding(&claims(2_000_000_000, nonce), channel_binding, &policy(provider))
     }
 
     #[test]
-    fn token_must_carry_this_app_and_the_login_secret() {
-        let nonce = bound_nonce(APP, SECRET);
-        assert!(binding(SocialProvider::Google, Some(&nonce), Some(SECRET)).is_ok());
+    fn token_must_carry_this_app_and_the_job_key() {
+        let key_a = channel_key();
+        let key_b = channel_key();
+        let (a, b) = (binding_of(&key_a), binding_of(&key_b));
+        let nonce = bound_nonce(APP, &a);
+        assert!(binding(SocialProvider::Google, Some(&nonce), &a).is_ok());
 
-        // Another app's login, for the same user and the same secret.
-        let other_app = bound_nonce("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", SECRET);
-        assert!(binding(SocialProvider::Google, Some(&other_app), Some(SECRET)).is_err());
+        let other_app = bound_nonce("9a8b7c6d-5e4f-4a3b-8c2d-1e0f9a8b7c6d", &a);
+        assert!(binding(SocialProvider::Google, Some(&other_app), &a).is_err());
 
-        // The token without the secret, or with someone else's.
-        assert!(binding(SocialProvider::Google, Some(&nonce), None).is_err());
-        let other_secret = "M25iVXpKU3puUjFaYWg3T1NDTDQtcW1ROUY5YXlwalNoc0hhakxifmZHag";
-        assert!(binding(SocialProvider::Google, Some(&nonce), Some(other_secret)).is_err());
+        assert!(binding(SocialProvider::Google, Some(&nonce), &b).is_err());
+        assert!(binding(SocialProvider::Google, None, &a).is_err());
+        assert!(binding(SocialProvider::Google, Some(APP), &a).is_err());
+        assert!(binding(SocialProvider::Google, Some(&a), &a).is_err());
+    }
 
-        // A short secret is refused even when it happens to match.
-        assert!(binding(SocialProvider::Google, Some(&bound_nonce(APP, "short")), Some("short"))
-            .is_err());
+    #[test]
+    fn the_nonce_the_enclave_issues_is_the_app_and_the_job_key_binding() {
+        let key = channel_key();
+        let job = binding_of(&key);
+        assert_eq!(login_nonce(APP, &job), format!("{APP}.{}", crypto::b64(crypto::sha256(&key))));
+        assert_eq!(login_nonce(APP, &job), bound_nonce(APP, &job));
+    }
 
-        assert!(binding(SocialProvider::Google, None, Some(SECRET)).is_err());
-        // The app half alone, or the hash half alone, is not the nonce.
-        assert!(binding(SocialProvider::Google, Some(APP), Some(SECRET)).is_err());
-        let hash_only = nonce.split_once('.').unwrap().1;
-        assert!(binding(SocialProvider::Google, Some(hash_only), Some(SECRET)).is_err());
+    #[test]
+    fn the_job_key_may_arrive_compressed() {
+        let key = PublicKey::from_sec1_bytes(&channel_key()).unwrap();
+        let nonce = bound_nonce(APP, &binding_of(key.to_encoded_point(false).as_bytes()));
+        let compressed = binding_of(key.to_encoded_point(true).as_bytes());
+        assert!(binding(SocialProvider::Google, Some(&nonce), &compressed).is_ok());
     }
 
     #[test]
     fn apple_may_hash_the_nonce_and_google_may_not() {
-        let hashed = hex_sha256(bound_nonce(APP, SECRET).as_bytes());
-        assert!(binding(SocialProvider::Apple, Some(&hashed), Some(SECRET)).is_ok());
-        assert!(binding(SocialProvider::Google, Some(&hashed), Some(SECRET)).is_err());
+        let job = binding_of(&channel_key());
+        let hashed = hex_sha256(bound_nonce(APP, &job).as_bytes());
+        assert!(binding(SocialProvider::Apple, Some(&hashed), &job).is_ok());
+        assert!(binding(SocialProvider::Google, Some(&hashed), &job).is_err());
+        assert!(binding(SocialProvider::Apple, Some(&hashed), &binding_of(&channel_key())).is_err());
     }
 
     #[test]
-    fn email_tokens_need_the_nonce_and_the_login_secret() {
-        let nonce = bound_nonce(APP, SECRET);
-        assert!(binding(SocialProvider::Email, Some(&nonce), Some(SECRET)).is_ok());
-        assert!(binding(SocialProvider::Email, None, Some(SECRET)).is_err());
-        assert!(binding(SocialProvider::Email, Some(&nonce), None).is_err());
-        assert!(binding(SocialProvider::Email, Some(&bound_nonce(APP, "short")), Some("short"))
-            .is_err());
+    fn email_tokens_need_the_nonce_and_the_job_key() {
+        let job = binding_of(&channel_key());
+        let nonce = bound_nonce(APP, &job);
+        assert!(binding(SocialProvider::Email, Some(&nonce), &job).is_ok());
+        assert!(binding(SocialProvider::Email, None, &job).is_err());
+        assert!(binding(SocialProvider::Email, Some(&nonce), &binding_of(&channel_key())).is_err());
     }
 
     fn email_policy() -> RecoveryPolicy {
@@ -562,54 +559,57 @@ mod tests {
         }
     }
 
-    fn email_credential(token: String, secret: Option<&str>) -> ProviderCredential {
+    fn email_credential(token: String) -> ProviderCredential {
         ProviderCredential {
             provider: SocialProvider::Email,
             token_fingerprint: URL_SAFE_NO_PAD.encode(Sha256::digest(token.as_bytes())),
             id_token: token,
-            nonce_preimage: secret.map(str::to_owned),
         }
     }
 
     async fn verify_email(
         signer: &LoginKey,
         verifier: &LoginKey,
-        secret: Option<&str>,
+        token_binding: &str,
+        job_binding: &str,
         policy: &RecoveryPolicy,
     ) -> Result<IdentityClaims> {
         let token = signer
-            .issue("user@gmail.com", &bound_nonce(APP, SECRET), unix_time()?)
+            .issue("user@gmail.com", &bound_nonce(APP, token_binding), unix_time()?)
             .unwrap();
-        let credential = email_credential(token, secret);
+        let credential = email_credential(token);
         let challenge = hex_sha256(credential.token_fingerprint.as_bytes());
-        verify_id_token(&reqwest::Client::new(), verifier, &credential, policy, &challenge).await
+        verify_id_token(&reqwest::Client::new(), verifier, &credential, policy, &challenge, job_binding)
+            .await
     }
 
     #[tokio::test]
     async fn a_token_issued_by_the_enclave_verifies_end_to_end() {
         let key = login::test_key(1);
-        let claims = verify_email(&key, &key, Some(SECRET), &email_policy()).await.unwrap();
+        let job = binding_of(&channel_key());
+        let claims = verify_email(&key, &key, &job, &job, &email_policy()).await.unwrap();
         assert_eq!(claims.sub, login::subject_id("user@gmail.com"));
     }
 
     #[tokio::test]
-    async fn an_email_token_fails_with_the_wrong_login_secret() {
+    async fn a_token_naming_one_key_fails_when_the_job_arrives_under_another() {
         let key = login::test_key(1);
-        let other = "M25iVXpKU3puUjFaYWg3T1NDTDQtcW1ROUY5YXlwalNoc0hhakxifmZHag";
-        assert!(verify_email(&key, &key, Some(other), &email_policy()).await.is_err());
-        assert!(verify_email(&key, &key, None, &email_policy()).await.is_err());
+        let (a, b) = (binding_of(&channel_key()), binding_of(&channel_key()));
+        assert!(verify_email(&key, &key, &a, &b, &email_policy()).await.is_err());
     }
 
     #[tokio::test]
     async fn an_email_token_signed_by_another_key_fails() {
         let signer = login::test_key(1);
         let verifier = login::test_key(2);
-        assert!(verify_email(&signer, &verifier, Some(SECRET), &email_policy()).await.is_err());
+        let job = binding_of(&channel_key());
+        assert!(verify_email(&signer, &verifier, &job, &job, &email_policy()).await.is_err());
     }
 
     #[tokio::test]
     async fn an_email_token_fails_under_a_non_contract_policy() {
         let key = login::test_key(1);
+        let job = binding_of(&channel_key());
         let mut wrong_issuer = email_policy();
         wrong_issuer.issuer = "https://securetoken.google.com/proj".into();
         let mut wrong_audience = email_policy();
@@ -617,7 +617,7 @@ mod tests {
         let mut wrong_jwks = email_policy();
         wrong_jwks.jwks_uri = "https://example.com/jwks".into();
         for policy in [wrong_issuer, wrong_audience, wrong_jwks] {
-            assert!(verify_email(&key, &key, Some(SECRET), &policy).await.is_err());
+            assert!(verify_email(&key, &key, &job, &job, &policy).await.is_err());
         }
     }
 }

@@ -219,6 +219,7 @@ fn build_http_client() -> Result<Client> {
 
     Client::builder()
         .timeout(Duration::from_secs(20))
+        .redirect(reqwest::redirect::Policy::none())
         // The provider JWKS endpoints an ID token may be verified against.
         .resolve("accounts.google.com", oidc)
         .resolve("www.googleapis.com", oidc)
@@ -302,8 +303,8 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
     match request {
         EnclaveRequest::Ping => Ok(EnclaveResponse::Pong),
 
-        EnclaveRequest::SendCode { email, app_id, app_name } => {
-            send_code(enclave, &email, &app_id, &app_name).await?;
+        EnclaveRequest::SendCode { email, app_id, app_name, login_binding } => {
+            send_code(enclave, &email, &app_id, &app_name, &login_binding).await?;
             Ok(EnclaveResponse::CodeSent)
         }
 
@@ -337,13 +338,15 @@ async fn handle(enclave: &Enclave, request: EnclaveRequest) -> Result<EnclaveRes
                     .map_err(|_| anyhow!("unknown, expired, or already-used session"))
                     .context(failure::Failure::SessionUnknown)?
             };
-            let (plaintext, response_key) = decrypt_job(&channel, &session_id, job)?;
+            let (plaintext, response_key, channel_binding) =
+                decrypt_job(&channel, &session_id, job)?;
             let job: WorkloadJob =
                 serde_json::from_slice(&plaintext).context("invalid recovery job")?;
             let result = process_job(
                 enclave,
                 job,
                 &auth_challenge_hash,
+                &channel_binding,
                 github.as_ref(),
                 telegram.as_deref(),
             )
@@ -388,23 +391,28 @@ fn validate_session_id(session_id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Open a job and name the client key it was encrypted under. The returned
+/// binding is the one login tokens must carry for this job to use them.
 fn decrypt_job(
     channel: &crypto::ChannelKey,
     session_id: &str,
     job: EncryptedJob,
-) -> Result<(Zeroizing<Vec<u8>>, crypto::ResponseKey)> {
-    channel.decrypt(
-        &crypto::unb64(&job.client_public_key_b64)?,
+) -> Result<(Zeroizing<Vec<u8>>, crypto::ResponseKey, String)> {
+    let client_public_key = crypto::unb64(&job.client_public_key_b64)?;
+    let (plaintext, response_key) = channel.decrypt(
+        &client_public_key,
         &crypto::unb64(&job.nonce_b64)?,
         &crypto::unb64(&job.ciphertext_b64)?,
         session_id,
-    )
+    )?;
+    Ok((plaintext, response_key, crypto::channel_binding(&client_public_key)?))
 }
 
 async fn process_job(
     enclave: &Enclave,
     job: WorkloadJob,
     auth_challenge_hash: &str,
+    channel_binding: &str,
     github: Option<&GithubGrant>,
     telegram: Option<&TelegramGrant>,
 ) -> Result<WorkloadResult> {
@@ -421,6 +429,7 @@ async fn process_job(
                     &credential,
                     &policy,
                     auth_challenge_hash,
+                    channel_binding,
                 )
                     .await?;
             let identity = crypto::identity_commitment(&policy, &claims.sub);
@@ -460,7 +469,14 @@ async fn process_job(
             stellar_recipient_pubkey_b64,
         } => {
             let (record, signing_key) =
-                open_record(enclave, &credential, &sealed_record_b64, auth_challenge_hash).await?;
+                open_record(
+                    enclave,
+                    &credential,
+                    &sealed_record_b64,
+                    auth_challenge_hash,
+                    channel_binding,
+                )
+                .await?;
 
             let mut signed = Vec::with_capacity(authorizations.len());
             for authorization in &authorizations {
@@ -486,7 +502,14 @@ async fn process_job(
 
         WorkloadJob::Confirm { credential, sealed_record_b64, stellar_dek_b64 } => {
             let (record, signing_key) =
-                open_record(enclave, &credential, &sealed_record_b64, auth_challenge_hash).await?;
+                open_record(
+                    enclave,
+                    &credential,
+                    &sealed_record_b64,
+                    auth_challenge_hash,
+                    channel_binding,
+                )
+                .await?;
             let (compressed, x, y) = crypto::recovery_public_parts(&signing_key);
             let dek_matches = match stellar_dek_b64 {
                 None => None,
@@ -513,45 +536,42 @@ async fn process_job(
             })
         }
 
-        WorkloadJob::VerifyEmail { email, code, client_nonce } => {
-            validate_client_nonce(&client_nonce)?;
+        WorkloadJob::VerifyEmail { email, code } => {
             let email = login::normalize_email(&email);
             let app_id = enclave
                 .codes
                 .lock()
                 .await
-                .verify(&email, &code, Instant::now())
+                .verify(&email, &code, channel_binding, Instant::now())
                 .ok_or_else(|| anyhow!("code rejected").context(failure::Failure::CodeRejected))?;
             let id_token = enclave.login.issue(
                 &email,
-                &format!("{app_id}.{client_nonce}"),
+                &oidc::login_nonce(&app_id, channel_binding),
                 oidc::unix_time()?,
             )?;
             Ok(WorkloadResult::EmailVerified { id_token })
         }
 
-        WorkloadJob::VerifyGithub { code_verifier, client_nonce } => {
+        WorkloadJob::VerifyGithub { code_verifier } => {
             let grant = github.ok_or_else(|| anyhow!("github grant is missing"))?;
-            validate_client_nonce(&client_nonce)?;
             validate_app_id(&grant.app_id)?;
             validate_code_verifier(&code_verifier)?;
             let user = github::user_for_code(&enclave.http, grant, &code_verifier).await?;
             let id_token = enclave.login.issue_github(
                 &user,
                 &grant.client_id,
-                &format!("{}.{client_nonce}", grant.app_id),
+                &oidc::login_nonce(&grant.app_id, channel_binding),
                 oidc::unix_time()?,
             )?;
             Ok(WorkloadResult::GithubVerified { id_token })
         }
 
-        WorkloadJob::VerifyTelegram { code_verifier, login_secret } => {
+        WorkloadJob::VerifyTelegram { code_verifier } => {
             let grant = telegram.ok_or_else(|| anyhow!("telegram grant is missing"))?;
-            validate_login_secret(&login_secret)?;
             validate_app_id(&grant.app_id)?;
             validate_bot_id(&grant.bot_id)?;
             validate_code_verifier(&code_verifier)?;
-            let nonce = format!("{}.{}", grant.app_id, client_nonce_for(&login_secret));
+            let nonce = oidc::login_nonce(&grant.app_id, channel_binding);
             let user =
                 telegram::user_for_code(&enclave.http, grant, &code_verifier, &nonce).await?;
             let id_token =
@@ -561,24 +581,32 @@ async fn process_job(
     }
 }
 
-/// Mail a fresh code to `email`.
+/// Mail a fresh code to `email`, redeemable only under the login key whose
+/// channel binding is `login_binding`.
 ///
 /// The code store is locked only to reserve the entry and to give it back; the
 /// SMTP exchange runs without it. Errors from the mail path are replaced by a
 /// fixed message because they can quote the recipient's address.
-async fn send_code(enclave: &Enclave, email: &str, app_id: &str, app_name: &str) -> Result<()> {
+async fn send_code(
+    enclave: &Enclave,
+    email: &str,
+    app_id: &str,
+    app_name: &str,
+    login_binding: &str,
+) -> Result<()> {
     let origin = enclave.mail_origin.as_ref().ok_or_else(|| {
         anyhow!("this enclave has no mail identity").context(failure::Failure::EmailUnavailable)
     })?;
     let (normalized, address) = validate_send_code(email, app_id, app_name)
         .context(failure::Failure::EmailInvalid)?;
+    validate_channel_binding(login_binding).context(failure::Failure::EmailInvalid)?;
 
     let code = codes::generate_code();
     enclave
         .codes
         .lock()
         .await
-        .reserve(&normalized, app_id, code.clone(), Instant::now())
+        .reserve(&normalized, app_id, login_binding, code.clone(), Instant::now())
         .map_err(|error| match error {
             CodeError::Cooldown => {
                 anyhow!("a code was sent too recently").context(failure::Failure::CodeCooldown)
@@ -628,36 +656,17 @@ fn validate_send_code(
     Ok((normalized, address))
 }
 
-fn validate_client_nonce(nonce: &str) -> Result<()> {
-    if nonce.len() != 43
-        || !nonce
+/// A channel binding as `crypto::channel_binding` makes it: the 43 base64url
+/// characters of a SHA-256.
+fn validate_channel_binding(binding: &str) -> Result<()> {
+    if binding.len() != 43
+        || !binding
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
     {
-        bail!("client nonce is malformed");
+        bail!("login binding is malformed");
     }
     Ok(())
-}
-
-/// A login secret as the kit makes it: at least 43 and at most 128 base64url
-/// characters, so its hash is never computed over a guessable value.
-fn validate_login_secret(secret: &str) -> Result<()> {
-    if !(43..=128).contains(&secret.len())
-        || !secret
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
-    {
-        bail!("login secret is malformed");
-    }
-    Ok(())
-}
-
-/// The client's half of a login nonce: `base64url(SHA-256(login_secret))`,
-/// the value the kit sent to the provider and the enclave later checks.
-fn client_nonce_for(login_secret: &str) -> String {
-    use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine};
-    use sha2::{Digest, Sha256};
-    URL_SAFE_NO_PAD.encode(Sha256::digest(login_secret.as_bytes()))
 }
 
 /// A Telegram bot id, which is also its OpenID Connect client id and the
@@ -706,6 +715,7 @@ async fn open_record(
     credential: &ProviderCredential,
     sealed_record_b64: &str,
     auth_challenge_hash: &str,
+    channel_binding: &str,
 ) -> Result<(SealedRecoveryRecord, SigningKey)> {
     let record_bytes = enclave.root.unseal(&crypto::unb64(sealed_record_b64)?)?;
     let record: SealedRecoveryRecord =
@@ -721,6 +731,7 @@ async fn open_record(
         credential,
         &record.policy,
         auth_challenge_hash,
+        channel_binding,
     )
     .await?;
     let identity = crypto::identity_commitment(&record.policy, &claims.sub);
@@ -737,28 +748,18 @@ async fn open_record(
 #[cfg(test)]
 mod tests {
     use super::{
-        client_nonce_for, validate_app_id, validate_bot_id, validate_client_nonce,
-        validate_code_verifier, validate_login_secret, validate_send_code, validate_session_id,
+        validate_app_id, validate_bot_id, validate_channel_binding, validate_code_verifier,
+        validate_send_code, validate_session_id,
     };
 
     #[test]
-    fn login_secret_is_long_base64url() {
-        assert!(validate_login_secret(&"a".repeat(43)).is_ok());
-        assert!(validate_login_secret(&"A_-9".repeat(32)).is_ok());
-        assert!(validate_login_secret(&"a".repeat(42)).is_err());
-        assert!(validate_login_secret(&"a".repeat(129)).is_err());
-        assert!(validate_login_secret(&format!("{}=", "a".repeat(43))).is_err());
-        assert!(validate_login_secret(&format!("{}.", "a".repeat(43))).is_err());
-        assert!(validate_login_secret("").is_err());
-    }
-
-    #[test]
-    fn client_nonce_is_the_pkce_s256_of_the_secret() {
-        assert_eq!(
-            client_nonce_for("dBjftJeZ4CVP-mB92K27uhbUJU1p1r_wW1gFWFOEjXk"),
-            "E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM"
-        );
-        assert!(validate_client_nonce(&client_nonce_for(&"a".repeat(43))).is_ok());
+    fn login_binding_is_a_base64url_sha256() {
+        assert!(validate_channel_binding("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM").is_ok());
+        assert!(validate_channel_binding("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c").is_err());
+        assert!(validate_channel_binding("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cMM").is_err());
+        assert!(validate_channel_binding("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw.cM").is_err());
+        assert!(validate_channel_binding("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw=cM").is_err());
+        assert!(validate_channel_binding("").is_err());
     }
 
     #[test]
@@ -835,14 +836,5 @@ mod tests {
         assert!(validate_code_verifier(&format!("{}=", "a".repeat(43))).is_err());
         assert!(validate_code_verifier(&format!("{} ", "a".repeat(43))).is_err());
         assert!(validate_code_verifier(&format!("{}&x=1", "a".repeat(43))).is_err());
-    }
-
-    #[test]
-    fn client_nonce_must_be_a_base64url_sha256() {
-        assert!(validate_client_nonce("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cM").is_ok());
-        assert!(validate_client_nonce("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-c").is_err());
-        assert!(validate_client_nonce("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw-cMM").is_err());
-        assert!(validate_client_nonce("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw.cM").is_err());
-        assert!(validate_client_nonce("E9Melhoa2OwvFrEMTJguCHaoeK1t8URWbuGJSstw=cM").is_err());
     }
 }

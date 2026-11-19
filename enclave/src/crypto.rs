@@ -46,6 +46,17 @@ pub fn sha256(bytes: impl AsRef<[u8]>) -> [u8; 32] {
     Sha256::digest(bytes).into()
 }
 
+/// The login-token binding of a client channel key: base64url, without padding,
+/// of the SHA-256 of the key's uncompressed SEC1 encoding (65 bytes).
+///
+/// The point is parsed and re-encoded uncompressed, so a compressed and an
+/// uncompressed encoding of one key give the same binding. A job that decrypts
+/// under this key was sent by whoever holds its private key.
+pub fn channel_binding(client_public_key: &[u8]) -> Result<String> {
+    let public = PublicKey::from_sec1_bytes(client_public_key).context("bad client P-256 key")?;
+    Ok(b64(sha256(public.to_encoded_point(false).as_bytes())))
+}
+
 pub fn identity_commitment(
     policy: &RecoveryPolicy,
     subject: &str,
@@ -423,6 +434,24 @@ mod tests {
         assert_eq!(open(&client_response_key, session).unwrap(), b"{\"result\":\"enrolled\"}");
         assert!(open(&key, session).is_err(), "the request key must not open the answer");
         assert!(open(&client_response_key, "other-session").is_err());
+    }
+
+    #[test]
+    fn channel_binding_is_the_hash_of_the_uncompressed_point() {
+        let secret = EphemeralSecret::random(&mut OsRng);
+        let public = PublicKey::from(&secret);
+        let uncompressed = public.to_encoded_point(false);
+        let compressed = public.to_encoded_point(true);
+        assert_eq!(uncompressed.as_bytes().len(), 65);
+        assert_eq!(compressed.as_bytes().len(), 33);
+        let binding = channel_binding(uncompressed.as_bytes()).unwrap();
+        assert_eq!(binding, channel_binding(compressed.as_bytes()).unwrap());
+        assert_eq!(binding, b64(Sha256::digest(uncompressed.as_bytes())));
+        assert_eq!(binding.len(), 43);
+
+        let other = PublicKey::from(&EphemeralSecret::random(&mut OsRng)).to_encoded_point(false);
+        assert_ne!(binding, channel_binding(other.as_bytes()).unwrap());
+        assert!(channel_binding(&[4u8; 65]).is_err());
     }
 
     #[test]

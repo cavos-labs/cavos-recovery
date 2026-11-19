@@ -27,6 +27,17 @@
 //! The parent holds the same credentials and still cannot decrypt: it cannot
 //! produce an attestation document, and KMS will not release the key without
 //! one. Credentials alone are not authority here — the measurement is.
+//!
+//! # Why the parent cannot choose the key
+//!
+//! The parent supplies the wrapped blob and the credentials, but not the key.
+//! The key ARN and the encryption context are compiled into this image, so they
+//! are measured into PCR0, and every `Decrypt` names them. KMS then enforces
+//! both: it uses only that key, and fails if the blob was wrapped under another
+//! key or under a different context. The region and endpoint are derived from
+//! the ARN for the same reason. This is what makes "ciphertext is safe to pass
+//! through the parent" true for the key's identity and not only for its
+//! confidentiality.
 
 use anyhow::{anyhow, bail, Context, Result};
 use hkdf::Hkdf;
@@ -59,6 +70,15 @@ fn kms_unb64(value: &str) -> Result<Vec<u8>> {
     STANDARD.decode(value).context("invalid base64 from KMS")
 }
 
+/// The only KMS key this enclave will unwrap its root key with. It must equal
+/// the `kms_key_arn` terraform output; an image built with another ARN fails
+/// closed at boot.
+pub const ROOT_KEY_ARN: &str =
+    "arn:aws:kms:us-east-1:858490660817:key/a0ed9d22-1214-45fe-9695-dff6dedded65";
+
+/// The encryption context the root key was wrapped under, as a key/value pair.
+pub const ROOT_KEY_CONTEXT: (&str, &str) = ("purpose", "cavos-recovery-root-key-v1");
+
 /// Domain separator for per-record keys derived from the root key.
 const RECORD_SEAL_INFO: &[u8] = b"cavos-record-seal-v1";
 /// Bytes of random salt stored alongside each sealed record.
@@ -72,9 +92,9 @@ const LOGIN_KEY_INFO: &[u8] = b"cavos-email-login-key-v1";
 pub struct RootKey(Zeroizing<[u8; 32]>);
 
 pub struct KmsConfig {
-    pub region: String,
     /// The KMS-wrapped root key. Ciphertext, so it is safe to pass through the
-    /// untrusted parent as an environment variable.
+    /// untrusted parent; KMS only unwraps it if it was produced under
+    /// [`ROOT_KEY_ARN`] and [`ROOT_KEY_CONTEXT`].
     pub wrapped_root_key_b64: String,
     pub access_key_id: String,
     pub secret_access_key: Zeroizing<String>,
@@ -85,6 +105,53 @@ pub struct KmsConfig {
 struct DecryptResponse {
     #[serde(rename = "CiphertextForRecipient")]
     ciphertext_for_recipient: Option<String>,
+    #[serde(rename = "KeyId")]
+    key_id: Option<String>,
+}
+
+/// The region segment of a KMS key ARN, which fixes the endpoint the enclave
+/// talks to so that the parent has no say in it.
+fn arn_region(arn: &str) -> Result<&str> {
+    match arn.split(':').collect::<Vec<_>>().as_slice() {
+        ["arn", "aws", "kms", region, account, resource]
+            if !region.is_empty()
+                && !account.is_empty()
+                && resource.strip_prefix("key/").is_some_and(|id| !id.is_empty()) =>
+        {
+            Ok(region)
+        }
+        _ => bail!("malformed KMS key ARN"),
+    }
+}
+
+pub fn endpoint_host() -> Result<String> {
+    Ok(format!("kms.{}.amazonaws.com", arn_region(ROOT_KEY_ARN)?))
+}
+
+fn decrypt_body(wrapped_root_key_b64: &str, attestation: &[u8]) -> String {
+    json!({
+        "CiphertextBlob": wrapped_root_key_b64,
+        "KeyId": ROOT_KEY_ARN,
+        "EncryptionContext": { ROOT_KEY_CONTEXT.0: ROOT_KEY_CONTEXT.1 },
+        "Recipient": {
+            "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
+            "AttestationDocument": kms_b64(attestation),
+        }
+    })
+    .to_string()
+}
+
+/// Returns the recipient envelope only when KMS reports that it used
+/// [`ROOT_KEY_ARN`], checked before the envelope is looked at.
+fn recipient_envelope(response: DecryptResponse) -> Result<String> {
+    match response.key_id.as_deref() {
+        Some(ROOT_KEY_ARN) => {}
+        Some(_) => bail!("KMS decrypted under a key other than the pinned root key"),
+        None => bail!("KMS did not report which key it used"),
+    }
+    response
+        .ciphertext_for_recipient
+        .ok_or_else(|| anyhow!("KMS did not envelope the response — was Recipient sent?"))
 }
 
 /// Unwrap the root key by asking KMS to decrypt it *to this enclave*.
@@ -104,16 +171,10 @@ pub async fn unwrap_root_key(nsm: &Nsm, http: &Client, config: &KmsConfig) -> Re
         .attest_for_kms(&public_der)
         .context("could not attest for KMS")?;
 
-    let body = json!({
-        "CiphertextBlob": config.wrapped_root_key_b64,
-        "Recipient": {
-            "KeyEncryptionAlgorithm": "RSAES_OAEP_SHA_256",
-            "AttestationDocument": kms_b64(&attestation),
-        }
-    })
-    .to_string();
+    let body = decrypt_body(&config.wrapped_root_key_b64, &attestation);
 
-    let host = format!("kms.{}.amazonaws.com", config.region);
+    let region = arn_region(ROOT_KEY_ARN)?;
+    let host = endpoint_host()?;
     let signed = sigv4::sign(
         &sigv4::Request {
             method: "POST",
@@ -121,7 +182,7 @@ pub async fn unwrap_root_key(nsm: &Nsm, http: &Client, config: &KmsConfig) -> Re
             path: "/",
             target: "TrentService.Decrypt",
             body: body.as_bytes(),
-            region: &config.region,
+            region,
             service: "kms",
             access_key_id: &config.access_key_id,
             secret_access_key: &config.secret_access_key,
@@ -155,12 +216,12 @@ pub async fn unwrap_root_key(nsm: &Nsm, http: &Client, config: &KmsConfig) -> Re
         );
     }
 
-    let envelope = response
-        .json::<DecryptResponse>()
-        .await
-        .context("malformed KMS response")?
-        .ciphertext_for_recipient
-        .ok_or_else(|| anyhow!("KMS did not envelope the response — was Recipient sent?"))?;
+    let envelope = recipient_envelope(
+        response
+            .json::<DecryptResponse>()
+            .await
+            .context("malformed KMS response")?,
+    )?;
 
     let plaintext = decrypt_cms(&kms_unb64(&envelope)?, &private)?;
     let bytes: [u8; 32] = plaintext
@@ -501,5 +562,82 @@ mod tests {
         let root = RootKey::for_test([7u8; 32]);
         assert!(root.unseal(&[0u8; SEAL_SALT_LEN + SEAL_NONCE_LEN]).is_err());
         assert!(root.unseal(b"short").is_err());
+    }
+
+    #[test]
+    fn parses_the_region_of_a_key_arn() {
+        assert_eq!(arn_region(ROOT_KEY_ARN).unwrap(), "us-east-1");
+    }
+
+    #[test]
+    fn rejects_malformed_key_arns() {
+        for arn in [
+            "",
+            "not-an-arn",
+            "arn:aws:kms",
+            "arn:aws:kms::858490660817:key/abc",
+            "arn:aws:kms:us-east-1::key/abc",
+            "arn:aws:kms:us-east-1:858490660817:alias/abc",
+            "arn:aws:kms:us-east-1:858490660817:key/",
+            "arn:aws:s3:us-east-1:858490660817:key/abc",
+            "xxx:aws:kms:us-east-1:858490660817:key/abc",
+        ] {
+            assert!(arn_region(arn).is_err(), "{arn}");
+        }
+    }
+
+    #[test]
+    fn derives_the_endpoint_from_the_pinned_arn() {
+        assert_eq!(endpoint_host().unwrap(), "kms.us-east-1.amazonaws.com");
+    }
+
+    #[test]
+    fn decrypt_body_names_the_key_and_context() {
+        let body: serde_json::Value =
+            serde_json::from_str(&decrypt_body("d3JhcHBlZA==", b"doc")).unwrap();
+        assert_eq!(body["KeyId"], ROOT_KEY_ARN);
+        assert_eq!(
+            body["EncryptionContext"],
+            json!({ "purpose": "cavos-recovery-root-key-v1" })
+        );
+        assert_eq!(body["CiphertextBlob"], "d3JhcHBlZA==");
+        assert_eq!(body["Recipient"]["KeyEncryptionAlgorithm"], "RSAES_OAEP_SHA_256");
+        assert_eq!(body["Recipient"]["AttestationDocument"], kms_b64(b"doc"));
+    }
+
+    #[test]
+    fn accepts_a_response_from_the_pinned_key() {
+        let response = DecryptResponse {
+            ciphertext_for_recipient: Some("envelope".into()),
+            key_id: Some(ROOT_KEY_ARN.into()),
+        };
+        assert_eq!(recipient_envelope(response).unwrap(), "envelope");
+    }
+
+    #[test]
+    fn rejects_a_response_from_another_key() {
+        let response = DecryptResponse {
+            ciphertext_for_recipient: Some("envelope".into()),
+            key_id: Some("arn:aws:kms:us-east-1:858490660817:key/other".into()),
+        };
+        assert!(recipient_envelope(response).is_err());
+    }
+
+    #[test]
+    fn rejects_a_response_without_a_key_id() {
+        let response = DecryptResponse {
+            ciphertext_for_recipient: Some("envelope".into()),
+            key_id: None,
+        };
+        assert!(recipient_envelope(response).is_err());
+    }
+
+    #[test]
+    fn rejects_a_pinned_key_response_without_an_envelope() {
+        let response = DecryptResponse {
+            ciphertext_for_recipient: None,
+            key_id: Some(ROOT_KEY_ARN.into()),
+        };
+        assert!(recipient_envelope(response).is_err());
     }
 }

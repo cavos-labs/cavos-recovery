@@ -22,6 +22,10 @@ resource "aws_kms_key" "root" {
   deletion_window_in_days = 30
   enable_key_rotation     = false # The enclave's key derivation is what rotates records.
 
+  lifecycle {
+    prevent_destroy = true
+  }
+
   policy = jsonencode({
     Version = "2012-10-17"
     Statement = [
@@ -33,10 +37,16 @@ resource "aws_kms_key" "root" {
         # `kms:CreateGrant`, and a grant can allow Decrypt with no attestation
         # condition at all — grant constraints are limited to encryption
         # context and source ARN.
+        #
+        # Disable, Delete and ScheduleKeyDeletion are deliberately absent:
+        # destroying the key means rewriting this policy first, which is the
+        # step the security alerts watch for. `kms:Put*` stays because deploys
+        # rewrite the policy; Enable and CancelKeyDeletion stay so a mistake can
+        # be undone.
         Action = [
           "kms:CreateAlias", "kms:Describe*", "kms:Enable*", "kms:List*",
-          "kms:Put*", "kms:Update*", "kms:Revoke*", "kms:Disable*",
-          "kms:Get*", "kms:Delete*", "kms:ScheduleKeyDeletion", "kms:CancelKeyDeletion",
+          "kms:Put*", "kms:Update*", "kms:Revoke*",
+          "kms:Get*", "kms:CancelKeyDeletion",
         ]
         Resource = "*"
       },
@@ -51,6 +61,11 @@ resource "aws_kms_key" "root" {
         # of its own choosing and have the enclave seal new records under it.
         Action   = ["kms:GenerateDataKeyWithoutPlaintext"]
         Resource = "*"
+        Condition = {
+          StringEquals = {
+            "kms:EncryptionContext:purpose" = "cavos-recovery-root-key-v1"
+          }
+        }
       },
       {
         Sid       = "AllowDecryptOnlyFromTheAttestedEnclave"
@@ -61,6 +76,9 @@ resource "aws_kms_key" "root" {
         Condition = {
           StringEqualsIgnoreCase = {
             "kms:RecipientAttestation:PCR0" = var.enclave_pcr0
+          }
+          StringEquals = {
+            "kms:EncryptionContext:purpose" = "cavos-recovery-root-key-v1"
           }
         }
       },
@@ -90,7 +108,8 @@ resource "aws_ssm_parameter" "wrapped_root_key" {
   value       = "PENDING_BOOTSTRAP"
 
   lifecycle {
-    ignore_changes = [value]
+    ignore_changes  = [value]
+    prevent_destroy = true
   }
 }
 

@@ -244,16 +244,17 @@ pub struct SealedResult {
 ///
 /// The parent is untrusted, and supplying this does not make it trusted:
 ///
-///   * `wrapped_root_key` is ciphertext under a KMS key the parent cannot
-///     encrypt to (its role has no `kms:Encrypt`), so it cannot substitute a
-///     root key of its own — and even if it could, that would let it seal new
-///     records, never read existing ones;
+///   * the parent cannot substitute a root key of its own: the enclave names
+///     the KMS key and encryption context itself, compiled into the measured
+///     image, and KMS refuses any blob wrapped under another key or context.
+///     The only principals able to produce a blob under that key are those its
+///     policy allows to call `GenerateDataKeyWithoutPlaintext`, which yields a
+///     random key nobody learns, so substitution is at worst denial of service;
 ///   * the credentials are the parent's own, and are not authority by
 ///     themselves: the key policy releases the root key only against an
 ///     attestation the parent cannot produce.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnclaveConfig {
-    pub region: String,
     pub wrapped_root_key_b64: String,
     pub access_key_id: String,
     pub secret_access_key: String,

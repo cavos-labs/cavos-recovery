@@ -162,7 +162,6 @@ async fn run() -> Result<()> {
         &nsm,
         &http,
         &kms::KmsConfig {
-            region: config.region.clone(),
             wrapped_root_key_b64: config.wrapped_root_key_b64.clone(),
             access_key_id: config.access_key_id.clone(),
             secret_access_key: Zeroizing::new(config.secret_access_key.clone()),
@@ -228,9 +227,7 @@ fn build_http_client() -> Result<Client> {
         .resolve("github.com", oidc)
         .resolve("api.github.com", oidc)
         .resolve("oauth.telegram.org", oidc)
-        // Regional KMS endpoints all resolve through the same proxy; the exact
-        // host is set by the configured region at call time.
-        .resolve("kms.us-east-1.amazonaws.com", local(KMS_HOST.local_port))
+        .resolve(&kms::endpoint_host()?, local(KMS_HOST.local_port))
         .build()
         .context("could not build the enclave HTTP client")
 }

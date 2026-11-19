@@ -17,6 +17,7 @@ It is **opt-in** per Cavos environment. It is **separate from Essential on-devic
 
 - The browser encrypts the job to a P-256 channel key taken **from inside** an AWS-signed attestation document, not from a relay-supplied JSON field alone.
 - KMS releases the root sealing key only when the recipient attestation measures to a pinned PCR0; instance IAM credentials alone are not authority.
+- The KMS key ARN and encryption context are compiled into the measured image, so the parent cannot make the enclave adopt a root key wrapped under a different key.
 - Attestation `user_data` binds a document to one session (`sha256(session_id)`).
 
 A compromise of relay or host is treated as **availability loss**, not credential disclosure or wallet recovery by the attacker.
@@ -62,6 +63,7 @@ Browser pin and KMS condition must agree for a given release.
 - Trust remains in the published measurement, AWS Nitro attestation PKI, and KMS PCR0 policy.
 - Spot interruption or `host_count = 0`: enroll/recover unavailable; device signing unaffected.
 - Caddy certificate material in S3 can be used to impersonate `enclave.cavos.xyz` toward the control plane (transport). That does **not** break attested encrypt or KMS PCR0.
+- An AWS account administrator can rewrite the KMS key policy (`kms:Put*`) and thereby obtain the root sealing key. This is detected (EventBridge alerts on key-policy, grant, deletion and parameter changes) but not prevented. The planned fix is enclave-to-enclave key forwarding gated by M-of-N offline approval keys compiled into the image, with one immutable KMS key per release; it is deferred until approval keys can be held by more than one independent person.
 - Root sealing key resides in enclave memory for the process lifetime; an enclave break is catastrophic for sealed records.
 
 ## Reporting

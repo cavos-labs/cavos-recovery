@@ -84,9 +84,11 @@ A release is a signed, attested build of the enclave image. To cut one, push a t
 git tag v3 && git push origin v3
 ```
 
-The `Release` workflow builds the image reproducibly, attests it with Sigstore, and publishes a GitHub release containing `enclave.eif`, `measurements.json` and `enclave-<pcr0>.sigstore.json`. The job runs in the `release` environment, so it waits for a required reviewer.
+The `Release` workflow refuses a tag whose commit is not on `main`, builds the image reproducibly, attests it with Sigstore, and publishes a GitHub release containing `enclave.eif`, `measurements.json` and `enclave-<pcr0>.sigstore.json`. The release is assembled as a draft and published once complete, so it works with immutable releases.
 
-`@cavos/kit` accepts any release published by this workflow. Each release expires 365 days after it is built, so publish a new tag before `expiresAt`.
+The job runs in the `release` environment, which only deploys from `v*` tags and waits for a required reviewer. Fulcio records that environment in the signing certificate, and `@cavos/kit` refuses a release whose certificate does not carry it, so removing the environment from the workflow in a tagged commit does not produce an accepted release. Repository rulesets restrict who can create a `v*` tag and forbid moving or deleting one.
+
+`@cavos/kit` accepts a release from this workflow and environment at or above its minimum version. Each release expires 365 days after it is built, so publish a new tag before `expiresAt`.
 
 Publishing a release does not deploy it. To run it, upload that release's `enclave.eif` to S3 and set `enclave_pcr0` (the KMS key policy) to its PCR0, as described in `infra/README.md`; those operator steps are unchanged.
 

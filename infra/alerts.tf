@@ -86,6 +86,20 @@ locals {
         }
       }
     }
+    # A denied call carries neither `resources` nor `requestParameters`, so the
+    # rule above cannot see a failed attempt on the root key. Denied KMS calls
+    # are rare enough in this account to alert on all of them.
+    kms_denied = {
+      kms       = false
+      read_only = true
+      detail = {
+        eventSource = ["kms.amazonaws.com"]
+        errorCode   = ["AccessDenied"]
+        userIdentity = {
+          arn = [{ "anything-but" = { prefix = "arn:aws:sts::${data.aws_caller_identity.current.account_id}:assumed-role/${aws_iam_role.instance.name}/" } }]
+        }
+      }
+    }
     ssm_param_name = {
       kms = false
       detail = {

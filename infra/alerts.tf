@@ -80,7 +80,7 @@ locals {
       detail = {
         eventSource = ["kms.amazonaws.com"]
         eventName   = ["Decrypt", "GenerateDataKey", "GenerateDataKeyWithoutPlaintext", "Encrypt", "ReEncrypt"]
-        resources   = { ARN = [aws_kms_key.root.arn] }
+        resources   = { ARN = [for key in module.release_key : key.arn] }
         userIdentity = {
           arn = [{ "anything-but" = { prefix = "arn:aws:sts::${data.aws_caller_identity.current.account_id}:assumed-role/${aws_iam_role.instance.name}/" } }]
         }

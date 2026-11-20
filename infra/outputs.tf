@@ -22,14 +22,18 @@ output "artifacts_bucket" {
   value       = aws_s3_bucket.artifacts.bucket
 }
 
-output "kms_key_arn" {
-  description = "Root sealing key. Only an enclave measuring to enclave_pcr0 can decrypt with it."
-  value       = aws_kms_key.root.arn
-}
-
-output "enclave_pcr0" {
-  description = "The measurement this deployment trusts. Must match the value pinned in @cavos/kit."
-  value       = var.enclave_pcr0
+output "release_keys" {
+  description = <<-EOT
+    The sealing key of each release. `arn` is what the release's image compiles
+    in as `ROOT_KEY_ARN`; `sealed` says whether its policy is final.
+  EOT
+  value = {
+    for release, key in module.release_key : release => {
+      arn    = key.arn
+      sealed = key.sealed
+      pcr0   = var.enclave_releases[release].pcr0
+    }
+  }
 }
 
 output "autoscaling_group" {

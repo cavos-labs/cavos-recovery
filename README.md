@@ -90,7 +90,7 @@ The job runs in the `release` environment, which only deploys from `v*` tags and
 
 `@cavos/kit` accepts a release from this workflow and environment at or above its minimum version. Each release expires 365 days after it is built, so publish a new tag before `expiresAt`.
 
-Publishing a release does not deploy it. To run it, upload that release's `enclave.eif` to S3 and set `enclave_pcr0` (the KMS key policy) to its PCR0, as described in `infra/README.md`; those operator steps are unchanged.
+Publishing a release does not deploy it. To run it, upload that release's `enclave.eif` to S3 and seal the release's KMS key to its PCR0, as described in `infra/README.md`.
 
 ## History
 

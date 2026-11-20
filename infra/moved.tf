@@ -17,3 +17,13 @@ moved {
   from = aws_autoscaling_group.enclave_host
   to   = module.host_us_east_1.aws_autoscaling_group.enclave_host
 }
+
+moved {
+  from = aws_kms_key.root
+  to   = module.release_key["v4"].aws_kms_key.this
+}
+
+moved {
+  from = aws_kms_alias.root
+  to   = module.release_key["v4"].aws_kms_alias.this
+}

@@ -6,89 +6,23 @@ locals {
 }
 
 # ---------------------------------------------------------------------------
-# KMS: the root sealing key
+# KMS: one sealing key per enclave release
 # ---------------------------------------------------------------------------
-# The enclave unwraps one 32-byte root key at startup and derives every record
-# key from it. This is the key that wraps it.
+# An enclave unwraps one 32-byte root key at startup and derives every record
+# key from it. Each release has a root key of its own, wrapped by a KMS key of
+# its own, and that key's policy names the one image that may unwrap it.
 #
-# The policy below is the whole security argument for running on an untrusted
-# parent. The instance role may call Decrypt, but only when the request carries
-# an attestation document measuring to `enclave_pcr0`. The parent instance holds
-# those same credentials and still cannot decrypt: it cannot produce an
-# attestation document at all. Credentials are not authority here — the
-# measurement is.
-resource "aws_kms_key" "root" {
-  description             = "Cavos social recovery root sealing key"
-  deletion_window_in_days = 30
-  enable_key_rotation     = false # The enclave's key derivation is what rotates records.
+# Keys are never shared or migrated between releases. A record can be opened
+# only by the release that sealed it, and clients enrol again with the current
+# release the next time they sign in. See `release-key/` for why nobody can
+# move a sealed key to another image.
+module "release_key" {
+  source   = "./release-key"
+  for_each = var.enclave_releases
 
-  lifecycle {
-    prevent_destroy = true
-  }
-
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [
-      {
-        Sid       = "AllowAccountAdministration"
-        Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
-        # `kms:CreateAlias` rather than `kms:Create*`: the wildcard also covers
-        # `kms:CreateGrant`, and a grant can allow Decrypt with no attestation
-        # condition at all — grant constraints are limited to encryption
-        # context and source ARN.
-        #
-        # Disable, Delete and ScheduleKeyDeletion are deliberately absent:
-        # destroying the key means rewriting this policy first, which is the
-        # step the security alerts watch for. `kms:Put*` stays because deploys
-        # rewrite the policy; Enable and CancelKeyDeletion stay so a mistake can
-        # be undone.
-        Action = [
-          "kms:CreateAlias", "kms:Describe*", "kms:Enable*", "kms:List*",
-          "kms:Put*", "kms:Update*", "kms:Revoke*",
-          "kms:Get*", "kms:CancelKeyDeletion",
-        ]
-        Resource = "*"
-      },
-      {
-        # Creating the wrapped root key. `GenerateDataKeyWithoutPlaintext` is
-        # deliberate: it returns only ciphertext, so the plaintext root key
-        # never exists outside KMS — not in a shell, not in terraform state.
-        Sid       = "AllowRootKeyCreation"
-        Effect    = "Allow"
-        Principal = { AWS = "arn:aws:iam::${data.aws_caller_identity.current.account_id}:root" }
-        # No `kms:Encrypt`: with it, an account principal could wrap a root key
-        # of its own choosing and have the enclave seal new records under it.
-        Action   = ["kms:GenerateDataKeyWithoutPlaintext"]
-        Resource = "*"
-        Condition = {
-          StringEquals = {
-            "kms:EncryptionContext:purpose" = "cavos-recovery-root-key-v1"
-          }
-        }
-      },
-      {
-        Sid       = "AllowDecryptOnlyFromTheAttestedEnclave"
-        Effect    = "Allow"
-        Principal = { AWS = aws_iam_role.instance.arn }
-        Action    = "kms:Decrypt"
-        Resource  = "*"
-        Condition = {
-          StringEqualsIgnoreCase = {
-            "kms:RecipientAttestation:PCR0" = var.enclave_pcr0
-          }
-          StringEquals = {
-            "kms:EncryptionContext:purpose" = "cavos-recovery-root-key-v1"
-          }
-        }
-      },
-    ]
-  })
-}
-
-resource "aws_kms_alias" "root" {
-  name          = "alias/${local.name}-root"
-  target_key_id = aws_kms_key.root.key_id
+  alias            = coalesce(each.value.alias, "${local.name}-${each.key}")
+  pcr0             = each.value.pcr0
+  enclave_role_arn = aws_iam_role.instance.arn
 }
 
 # ---------------------------------------------------------------------------
@@ -265,10 +199,6 @@ resource "aws_iam_role_policy" "instance" {
         )
       },
       {
-        # Note there is no kms:Decrypt here. The instance role is granted that
-        # by the *key* policy, and only under the attestation condition. Adding
-        # it to the identity policy would not widen access — both must allow —
-        # but leaving it out keeps the grant readable in exactly one place.
         Sid      = "DecryptItsOwnSsmParameters"
         Effect   = "Allow"
         Action   = ["kms:Decrypt"]
@@ -277,6 +207,20 @@ resource "aws_iam_role_policy" "instance" {
           StringEquals = {
             "kms:ViaService" = "ssm.${data.aws_region.current.name}.amazonaws.com"
           }
+        }
+      },
+      {
+        # A sealed release key names this role, so this statement changes
+        # nothing today. It is what lets a replacement role decrypt through
+        # the account, which the key also names. Requiring an attestation
+        # document keeps it useless to the parent instance, which holds these
+        # credentials and cannot produce one.
+        Sid      = "DecryptAsAnAttestedEnclave"
+        Effect   = "Allow"
+        Action   = ["kms:Decrypt"]
+        Resource = "*"
+        Condition = {
+          Null = { "kms:RecipientAttestation:PCR0" = "false" }
         }
       },
     ]

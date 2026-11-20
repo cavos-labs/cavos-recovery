@@ -41,8 +41,8 @@ at = raw.find(b"\x00\x58\x30", raw.find(b"pcrs"))
 print("PCR0", raw[at + 3 : at + 51].hex())'
 ```
 
-Compare that against `enclave_pcr0` in `variables.tf` **and** the list in
-`kit/src/recovery/attestationDefaults.ts`. All three must agree.
+Compare that against the release's `pcr0` in `enclave_releases` and against its
+signed release on GitHub. All three must agree.
 
 ### Off
 
@@ -82,10 +82,9 @@ undone.
      --target aarch64-unknown-linux-musl'
   ```
 
-- **Changing PCR0 is half a deploy.** The new EIF has to be in S3 in the same
-  step, or the enclave boots and dies unable to unwrap the root key — and
-  `@cavos/kit` must already accept the new measurement, because the browser
-  checks it before KMS ever sees anything. See *The measurement*.
+- **A release runs only against its own key.** The EIF in S3 has to be the
+  image its key was sealed to, or the enclave boots and dies unable to unwrap
+  the root key. See *One sealing key per release*.
 - **Diagnostics are off by default.** The enclave names the check that refused a
   request, but the relay's outbound forwarder logs at debug. If recovery is
   failing and you need to know whether the enclave is reaching a provider's
@@ -130,12 +129,9 @@ copied to laptops and CI. The script uses `generate-data-key-without-plaintext`,
 so the plaintext is created inside KMS and never exists anywhere else.
 
 The enclave names its KMS key itself: `ROOT_KEY_ARN` in `enclave/src/kms.rs`
-must equal `terraform output kms_key_arn`, and an enclave built with a
-different ARN fails closed at boot. The root key is also wrapped under the
-encryption context `purpose=cavos-recovery-root-key-v1`. A root key wrapped
-before this was added has no context and cannot be unwrapped by the new image,
-so adopting this release means re-running `bootstrap-secrets.sh`, which
-replaces the root key and makes every previously sealed record unreadable.
+must equal the `arn` of its release in `terraform output release_keys`, and an
+enclave built with a different ARN fails closed at boot. The root key is also
+wrapped under the encryption context `purpose=cavos-recovery-root-key-v1`.
 
 Then upload the artifacts and point DNS at the instance:
 
@@ -155,14 +151,42 @@ Finally, add an `A` record for `enclave.cavos.xyz` pointing at the
 zone for it. Caddy cannot obtain a certificate until that record resolves, so
 the relay is unreachable over HTTPS until this is done.
 
-## The measurement
+## One sealing key per release
 
-`enclave_pcr0` is the security-critical variable. It appears in two places that
-must agree:
+Each release in `enclave_releases` has a KMS key of its own, made by the
+`release-key/` module. A key starts open and is sealed once:
 
-- the KMS key policy here, which refuses to release the root key to anything
+1. Add the release without `pcr0` and apply. This creates the key.
+2. Put the key's ARN in `ROOT_KEY_ARN`, and run `./bootstrap-secrets.sh <release>`
+   to create its wrapped root key.
+3. Tag and publish the release, then set `pcr0` to the PCR0 of the signed
+   release and apply. This seals the key.
+4. Run `./verify-release-key.sh <key-arn> <pcr0>`.
+
+A sealed key lets one image decrypt and lets nobody write its policy, create a
+grant or encrypt, so there is no later step that moves it to another image.
+Nothing is migrated between releases: a record is opened by the release that
+sealed it, and clients enrol again with the current release when they next
+sign in. An earlier release therefore has to stay bootable for as long as
+records sealed by it should be recoverable, and no longer than its signed
+release is valid (365 days from its build).
+
+Two things about a sealed key are worth knowing before sealing one:
+
+- Its wrapped root key cannot be regenerated. Losing the SSM parameter loses
+  every record of that release, so keep a copy of the ciphertext elsewhere.
+- It can still be disabled or scheduled for deletion. That stops the release
+  and reveals nothing.
+
+`release-key/test/run.sh` proves the seal on a throwaway key: it seals one and
+then tries every call that would reach the root key.
+
+`pcr0` is the security-critical value. It appears in two places that must
+agree:
+
+- the key policy here, which refuses to release the root key to anything
   measuring differently;
-- `kit/src/recovery/attestationDefaults.ts` in the SDK, which is what browsers accept.
+- the signed release on GitHub, which is what browsers accept.
 
 Re-derive it with `enclave/scripts/build-enclave.sh`, which is reproducible: two
 independent builds of the same source produce the same value, so the published

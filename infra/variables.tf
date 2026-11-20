@@ -84,32 +84,43 @@ variable "enclave_memory_mib" {
   default     = 1024
 }
 
-variable "enclave_pcr0" {
+variable "enclave_releases" {
   description = <<-EOT
-    The measurement of the enclave image, from `scripts/build-enclave.sh`.
+    Every enclave release that has a sealing key, by tag (`v4`, `v5`, ...).
 
-    This is the security-critical value: the KMS key policy will not release the
-    root sealing key to anything that does not measure to it. It must match a
-    value pinned in `@cavos/kit`, or browsers and KMS will disagree about which
-    enclave is legitimate.
+    `pcr0` is the measurement of the release's image, from its signed release
+    on GitHub. It is the security-critical value: the release's KMS key will
+    not hand the root sealing key to anything that measures differently.
 
-    Changing it is half of a deploy: KMS will then release the root key only to
-    the new image, so the new EIF has to be uploaded in the same step or the
-    running enclave dies at boot unable to unwrap it. And the SDK has to accept
-    the new measurement *before* either — it is checked in the browser, ahead of
-    KMS, so an enclave nobody accepts is one nobody can reach.
+    Add a release without `pcr0` to create its key, compile the key ARN into
+    the image, publish the release, then set `pcr0` to seal the key. A sealed
+    entry is final: its key policy can no longer be written, so `pcr0` cannot
+    be changed, and removing the entry does not delete the key.
+
+    `alias` only exists for the key that predates this scheme.
   EOT
-  type        = string
-  default     = "466a4cbe5089af98486b1ce1953cc5acf98c40d22d9c8fb24049ca364c67cbc277c7b94263fc962e346f72627d1a51ab"
-
-  validation {
-    condition     = can(regex("^[0-9a-f]{96}$", var.enclave_pcr0))
-    error_message = "PCR0 must be 96 lowercase hex characters (a SHA-384 digest)."
+  type = map(object({
+    pcr0  = optional(string)
+    alias = optional(string)
+  }))
+  default = {
+    v4 = {
+      pcr0  = "466a4cbe5089af98486b1ce1953cc5acf98c40d22d9c8fb24049ca364c67cbc277c7b94263fc962e346f72627d1a51ab"
+      alias = "cavos-recovery-root"
+    }
   }
 
   validation {
-    condition     = var.enclave_pcr0 != join("", [for _ in range(96) : "0"])
-    error_message = "PCR0 must not be all zeros. That is what an enclave started in debug mode reports, and the key policy must never trust it."
+    condition     = alltrue([for release in keys(var.enclave_releases) : can(regex("^v[1-9][0-9]*$", release))])
+    error_message = "Releases are named after their tag: v4, v5, and so on."
+  }
+
+  validation {
+    condition = (
+      length(compact([for release in values(var.enclave_releases) : release.pcr0])) ==
+      length(distinct(compact([for release in values(var.enclave_releases) : release.pcr0])))
+    )
+    error_message = "Two releases cannot share a PCR0: a key is sealed to one image, and an image names one key."
   }
 }
 

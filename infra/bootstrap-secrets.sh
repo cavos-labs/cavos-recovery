@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 #
 # Create the two secrets the enclave host reads at boot. Run once, after the
-# first `terraform apply`.
+# `terraform apply` that creates the release's key and before the one that
+# seals it: a sealed key no longer generates root keys.
 #
 # The root key is generated with `generate-data-key-without-plaintext`, which
 # returns only ciphertext. The plaintext 32 bytes are created inside KMS and
@@ -14,8 +15,19 @@ set -euo pipefail
 REGION=${AWS_REGION:-us-east-1}
 NAME=cavos-recovery
 
-key_arn=$(terraform output -raw kms_key_arn)
-echo "==> Using KMS key $key_arn"
+RELEASE=${1:?usage: bootstrap-secrets.sh <release>, for example v5}
+
+key_arn=$(terraform output -json release_keys | jq -er --arg release "$RELEASE" '.[$release].arn')
+echo "==> Using the KMS key of $RELEASE: $key_arn"
+
+# A wrapped root key is the only way into every record sealed under it, and a
+# sealed KMS key can never produce another. Never write over one.
+current=$(aws ssm get-parameter --name "/$NAME/wrapped-root-key" \
+  --region "$REGION" --query Parameter.Value --output text)
+if [[ "$current" != "PENDING_BOOTSTRAP" ]]; then
+  echo "A wrapped root key is already stored; refusing to replace it." >&2
+  exit 1
+fi
 
 echo "==> Generating the wrapped root key"
 wrapped=$(aws kms generate-data-key-without-plaintext \

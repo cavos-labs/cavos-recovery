@@ -12,6 +12,10 @@ enclave/build/
 infra/.terraform/
 infra/*.tfstate
 infra/*.tfstate.*
+infra/release-key/test/.terraform/
+infra/release-key/test/.terraform.lock.hcl
+infra/release-key/test/*.tfstate
+infra/release-key/test/*.tfstate.*
 infra/tfplan
 
 # Release binaries, uploaded to S3 rather than committed.
